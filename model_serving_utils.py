@@ -12,7 +12,7 @@ w = WorkspaceClient(host=DBX_HOST, token=DBX_TOKEN)
 
 def _get_endpoint_task_type(endpoint_name: str) -> str:
     """Get the task type of a serving endpoint."""
-    w = WorkspaceClient()
+    w = WorkspaceClient(host=DBX_HOST, token=DBX_TOKEN)
     ep = w.serving_endpoints.get(endpoint_name)
     return ep.task
 
