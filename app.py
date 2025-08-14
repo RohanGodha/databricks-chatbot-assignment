@@ -6,8 +6,8 @@ from model_serving_utils import query_endpoint, is_endpoint_supported
 from databricks.sdk import WorkspaceClient
 
 # Read from environment variables (Streamlit secrets)
-DBX_HOST = os.environ.get("DATABRICKS_HOST")
-DBX_TOKEN = os.environ.get("DATABRICKS_TOKEN")
+DBX_HOST = "https://dbc-3cf3bb0b-20e2.cloud.databricks.com"
+DBX_TOKEN = "dapi60cbb451dffd5c7e6217facb700ef401"
 
 # Initialize Databricks WorkspaceClient
 w = WorkspaceClient(host=DBX_HOST, token=DBX_TOKEN)
