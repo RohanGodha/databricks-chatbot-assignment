@@ -1,3 +1,4 @@
 mlflow>=2.21.2
 streamlit==1.44.1
 databricks-sdk
+pdfplumber
