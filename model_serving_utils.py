@@ -3,9 +3,8 @@ from databricks.sdk import WorkspaceClient
 from mlflow.deployments import get_deploy_client
 from databricks.sdk import WorkspaceClient
 
-
-DBX_HOST = os.environ.get("DATABRICKS_HOST")
-DBX_TOKEN = os.environ.get("DATABRICKS_TOKEN")
+DBX_HOST = "https://dbc-3cf3bb0b-20e2.cloud.databricks.com"
+DBX_TOKEN = "dapi60cbb451dffd5c7e6217facb700ef401"
 
 w = WorkspaceClient(host=DBX_HOST, token=DBX_TOKEN)
 
