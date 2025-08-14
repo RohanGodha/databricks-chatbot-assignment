@@ -1,5 +1,14 @@
+import os
+from databricks.sdk import WorkspaceClient
 from mlflow.deployments import get_deploy_client
 from databricks.sdk import WorkspaceClient
+
+
+DBX_HOST = os.environ.get("DATABRICKS_HOST")
+DBX_TOKEN = os.environ.get("DATABRICKS_TOKEN")
+
+w = WorkspaceClient(host=DBX_HOST, token=DBX_TOKEN)
+
 
 def _get_endpoint_task_type(endpoint_name: str) -> str:
     """Get the task type of a serving endpoint."""
