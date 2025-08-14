@@ -3,6 +3,14 @@ import os
 import streamlit as st
 import pdfplumber
 from model_serving_utils import query_endpoint, is_endpoint_supported
+from databricks.sdk import WorkspaceClient
+
+# Read from environment variables (Streamlit secrets)
+DBX_HOST = os.environ.get("DATABRICKS_HOST")
+DBX_TOKEN = os.environ.get("DATABRICKS_TOKEN")
+
+# Initialize Databricks WorkspaceClient
+w = WorkspaceClient(host=DBX_HOST, token=DBX_TOKEN)
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
