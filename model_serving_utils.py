@@ -1,10 +1,18 @@
 import os
+from dotenv import load_dotenv
 from databricks.sdk import WorkspaceClient
 from mlflow.deployments import get_deploy_client
-from databricks.sdk import WorkspaceClient
 
-DBX_HOST = "https://dbc-3cf3bb0b-20e2.cloud.databricks.com"
-DBX_TOKEN = "dapi60cbb451dffd5c7e6217facb700ef401"
+# Load environment variables from .env
+load_dotenv()
+
+# Read from env (remove spaces around '=' in .env)
+DBX_HOST = os.getenv("DATABRICKS_HOST")
+DBX_TOKEN = os.getenv("DATABRICKS_TOKEN")
+
+# Make sure MLflow also gets them
+os.environ["DATABRICKS_HOST"] = DBX_HOST
+os.environ["DATABRICKS_TOKEN"] = DBX_TOKEN
 
 w = WorkspaceClient(host=DBX_HOST, token=DBX_TOKEN)
 
