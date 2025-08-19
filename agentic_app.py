@@ -27,42 +27,31 @@ vsc = VectorSearchClient()
 # --------------------
 # Ensure Delta table + VS index
 # --------------------
-# def ensure_table_and_index(dim=1024):
-#     conn = sql.connect(server_hostname=DB_HOST, http_path=DB_HTTP_PATH, access_token=DB_TOKEN)
-#     with conn.cursor() as c:
-#         c.execute(f"""CREATE TABLE IF NOT EXISTS {DELTA_TABLE} (
-#             doc_id STRING, pdf_name STRING, page INT, chunk_id STRING,
-#             content STRING, embedding ARRAY<FLOAT>, created_at TIMESTAMP
-#         ) USING DELTA""")
-#     conn.close()
+def ensure_table_and_index(dim: int = 1024):
+    """Ensure Delta table, VS endpoint, and sync index are ready for RAG."""
 
-#     try: vsc.get_endpoint(VS_ENDPOINT)
-#     except: vsc.create_endpoint(name=VS_ENDPOINT, endpoint_type="STANDARD")
-
-#     try: vsc.get_index(VS_ENDPOINT, VS_INDEX)
-#     except:
-#         vsc.create_delta_sync_index(
-#             endpoint_name=VS_ENDPOINT,
-#             index_name=VS_INDEX,
-#             source_table_name=DELTA_TABLE,
-#             pipeline_type="TRIGGERED",
-#             primary_key="chunk_id",
-#             embedding_dimension=dim,
-#             embedding_vector_column="embedding",
-#             schema={"doc_id":"string","pdf_name":"string","page":"int","content":"string"},
-#         )
-
-def ensure_table_and_index(dim=1024):
-    # Ensure table
-    conn = sql.connect(server_hostname=DB_HOST, http_path=DB_HTTP_PATH, access_token=DB_TOKEN)
+    # 1. Ensure table exists with CDF enabled
+    conn = sql.connect(
+        server_hostname=DB_HOST,
+        http_path=DB_HTTP_PATH,
+        access_token=DB_TOKEN
+    )
     with conn.cursor() as c:
-        c.execute(f"""CREATE TABLE IF NOT EXISTS {DELTA_TABLE} (
-            doc_id STRING, pdf_name STRING, page INT, chunk_id STRING,
-            content STRING, embedding ARRAY<FLOAT>, created_at TIMESTAMP
-        ) USING DELTA""")
+        c.execute(f"""
+        CREATE TABLE IF NOT EXISTS {DELTA_TABLE} (
+            doc_id STRING,
+            pdf_name STRING,
+            page INT,
+            chunk_id STRING,
+            content STRING,
+            embedding ARRAY<FLOAT>,
+            created_at TIMESTAMP
+        ) USING DELTA
+        TBLPROPERTIES (delta.enableChangeDataFeed = true)
+        """)
     conn.close()
 
-    # Ensure endpoint (reuse existing if quota=1)
+    # 2. Ensure endpoint (reuse existing if one exists)
     eps = vsc.list_endpoints().get("endpoints", [])
     if eps:
         existing = eps[0]["name"]
@@ -75,23 +64,35 @@ def ensure_table_and_index(dim=1024):
         os.environ["VS_ENDPOINT"] = ep["name"]
         globals()["VS_ENDPOINT"] = ep["name"]
 
-    # Ensure index
+    # 3. Ensure index (Direct Access is fine here)
     try:
-        vsc.get_index(VS_ENDPOINT, VS_INDEX)
-    except Exception:
-        vsc.create_delta_sync_index(
-            endpoint_name=VS_ENDPOINT,
-            index_name=VS_INDEX,
-            source_table_name=DELTA_TABLE,
-            pipeline_type="TRIGGERED",
-            primary_key="chunk_id",
-            embedding_dimension=dim,
-            embedding_vector_column="embedding"
-        )
+        idx = vsc.get_index(VS_ENDPOINT, VS_INDEX)
+        st.info(f"Index already exists: {VS_INDEX}, reusing it ✅")
+    except Exception as e:
+        if "RESOURCE_DOES_NOT_EXIST" in str(e) or "NOT_FOUND" in str(e):
+            st.warning(f"Index {VS_INDEX} not found, creating it...")
+            vsc.create_delta_sync_index(
+                endpoint_name=VS_ENDPOINT,
+                index_name=VS_INDEX,
+                source_table_name=DELTA_TABLE,
+                pipeline_type="TRIGGERED",   # CONTINUOUS not supported in your workspace
+                primary_key="chunk_id",
+                embedding_dimension=dim,
+                embedding_vector_column="embedding"
+                # ❌ no embedding_model_endpoint_name → Direct Access index
+            )
+            st.success(f"Created index {VS_INDEX} as Direct Access ✅")
+        else:
+            raise
 
-
-def sync_index():
-    vsc.get_index(VS_ENDPOINT, VS_INDEX).sync()
+def sync_index_safe():
+    """Trigger sync on TRIGGERED pipelines after new data is added."""
+    try:
+        st.info("Syncing index...")
+        vsc.get_index(VS_ENDPOINT, VS_INDEX).run()
+        st.success("Index sync triggered ✅")
+    except Exception as e:
+        st.error(f"Failed to sync index: {e}")
 
 # --------------------
 # PDF ingestion
@@ -109,7 +110,9 @@ def chunk_text(text, max_chars=1200, overlap=200):
 
 def embed_chunks(chunks):
     out = client.predict(endpoint=EMBEDDING_ENDPOINT, inputs={"input": chunks})
-    return [row["embedding"] for row in out["data"]]
+    # st.write("DEBUG embedding response:", out) 
+    return [row.get("embedding", []) for row in out.get("data", [])]
+
 
 def write_rows(rows):
     conn = sql.connect(server_hostname=DB_HOST, http_path=DB_HTTP_PATH, access_token=DB_TOKEN)
@@ -125,19 +128,33 @@ def ingest_pdf(file_bytes, pdf_name):
             chunks = chunk_text(text)
             if not chunks: continue
             embs = embed_chunks(chunks)
-            now = dt.datetime.utcnow()
+            now = dt.datetime.now(dt.timezone.utc)
             for ch, emb in zip(chunks, embs):
                 rows.append((doc_id, pdf_name, pageno, str(uuid.uuid4()), ch, emb, now))
     if rows: write_rows(rows)
-    sync_index()  # auto sync index after ingestion
+    sync_index_safe()  # auto sync index after ingestion
     return {"doc_id": doc_id, "chunks": len(rows)}
+
+
 
 # --------------------
 # Agentic Retriever
 # --------------------
 def retrieve(query, k=5):
     idx = vsc.get_index(VS_ENDPOINT, VS_INDEX)
-    res = idx.similarity_search(query_text=query, num_results=k, columns=["doc_id","pdf_name","page","content"])
+
+    # ✅ manually embed query because this is a Direct Access index
+    q_emb = client.predict(
+        endpoint=EMBEDDING_ENDPOINT,
+        inputs={"input": [query]}
+    )["data"][0]["embedding"]
+
+    res = idx.similarity_search(
+        query_vector=q_emb,  # ✅ use query_vector, not query_text
+        num_results=k,
+        columns=["doc_id","pdf_name","page","content"]
+    )
+
     rows = res.get("result",{}).get("data_array",[])
     return [{"doc_id":r[0],"pdf_name":r[1],"page":r[2],"content":r[3]} for r in rows]
 
@@ -202,34 +219,3 @@ if q:
         with st.expander("Sources"):
             for c in ctx: st.markdown(f"📄 **{c['pdf_name']}** (p.{c['page']})\n\n> {c['content'][:300]}...")
     st.session_state.history.append({"role":"assistant","content":ans})
-
-
-# import streamlit as st
-# from dotenv import load_dotenv
-# from 01_ingest_pdf import ingest_pdf
-# from 03_retriever import chat_with_rag, AGENTIC_MODE
-
-# load_dotenv()
-# st.set_page_config(page_title="Databricks RAG Agent", page_icon="🧠")
-# st.title("🧠 Databricks Agentic RAG Chat")
-
-# st.sidebar.header("Upload PDF")
-# f = st.sidebar.file_uploader("Choose a PDF", type=["pdf"])
-# if st.sidebar.button("Ingest", disabled=not f):
-#     r = ingest_pdf(f.read(), f.name)
-#     st.sidebar.success(f"Ingested {r['chunks']} chunks (doc_id={r['doc_id']}). Remember to sync index!")
-
-# if "history" not in st.session_state: st.session_state.history = []
-# for msg in st.session_state.history:
-#     with st.chat_message(msg["role"]): st.markdown(msg["content"])
-
-# q = st.chat_input("Ask me anything about your documents…")
-# if q:
-#     st.session_state.history.append({"role":"user","content":q})
-#     with st.chat_message("assistant"):
-#         with st.spinner("🔍 Thinking (agent mode)" if AGENTIC_MODE else "🤔 Thinking…"):
-#             ans, ctx = chat_with_rag(q, st.session_state.history[:-1])
-#         st.markdown(ans)
-#         with st.expander("Sources"):
-#             for c in ctx: st.markdown(f"📄 **{c['pdf_name']}** (p.{c['page']})\n\n> {c['content'][:300]}...")
-#     st.session_state.history.append({"role":"assistant","content":ans})
