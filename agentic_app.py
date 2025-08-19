@@ -164,31 +164,132 @@ def call_llm(messages, max_tokens=400):
     if "content" in resp: return resp["content"]
     return str(resp)[:2000]
 
-def agentic_chat(question, history=None, max_loops=3, k=5):
-    history = history or []
-    for _ in range(max_loops):
-        ctx = retrieve(question, k=k)
-        system = (
-            "You are an agent with tool access.\n"
-            "Tools:\n - Search(query): retrieves from documents.\n"
-            "If insufficient context, reply with: TOOL:SEARCH <better query>\n"
-            "Otherwise answer with citations.\n\n"
-            "Context:\n" + "\n---\n".join(c['content'] for c in ctx)
-        )
-        msgs = [{"role":"system","content":system}] + history + [{"role":"user","content":question}]
-        reply = call_llm(msgs)
-        if reply.strip().upper().startswith("TOOL:SEARCH"):
-            question = reply.split(" ",1)[1] if " " in reply else question
-            continue
-        return reply, ctx
-    return "I could not find enough context.", ctx
+# ---- Replace/insert these helper functions ----
+def embed_query_single(text):
+    """
+    Return a single embedding vector for `text` using the EMBEDDING_ENDPOINT.
+    Reuses the databricks deployment client.
+    """
+    # The embedding endpoint in your setup expects an array-of-inputs or a single input.
+    # We'll call it with a single-item list to get a single embedding back.
+    out = client.predict(endpoint=EMBEDDING_ENDPOINT, inputs={"input": [text]})
+    # expected shape: out.get("data", []) -> list of rows, each a dict with "embedding"
+    data = out.get("data", [])
+    if not data:
+        raise RuntimeError(f"Embedding endpoint returned no data: {out}")
+    return data[0].get("embedding", [])
+
+
+def retrieve(query: str, k: int = 5):
+    """
+    Retrieve top-k chunks relevant to the query from Vector Search.
+    Returns: list of dicts: {"doc_id":..., "pdf_name":..., "page":..., "content":...}
+    Works for both text-query-capable indexes and Direct Access indexes (by falling back
+    to query_vector).
+    """
+    try:
+        idx = vsc.get_index(VS_ENDPOINT, VS_INDEX)
+
+        # First try text-based query (works if the index supports query_text)
+        try:
+            res = idx.similarity_search(
+                query_text=query,
+                num_results=k,
+                columns=["doc_id", "pdf_name", "page", "content"]
+            )
+        except Exception as e:
+            # If the index requires a query vector (Direct Access), compute embedding and retry
+            err_text = str(e)
+            if "query vector must be specified" in err_text or "RESOURCE_DOES_NOT_EXIST" in err_text or "INVALID_PARAMETER_VALUE" in err_text:
+                # compute vector and retry
+                emb = embed_query_single(query)
+                res = idx.similarity_search(
+                    query_vector=emb,
+                    num_results=k,
+                    columns=["doc_id", "pdf_name", "page", "content"]
+                )
+            else:
+                # re-raise if it's some other error
+                raise
+
+        matches = res.get("result", {}).get("data_array", [])
+        out = []
+        for m in matches:
+            # m format: [doc_id, pdf_name, page, content]
+            # safety: some entries may be None or shorter - guard against that
+            doc_id = m[0] if len(m) > 0 else None
+            pdf_name = m[1] if len(m) > 1 else "unknown"
+            page = m[2] if len(m) > 2 else None
+            content = m[3] if len(m) > 3 else ""
+            out.append({
+                "doc_id": doc_id,
+                "pdf_name": pdf_name,
+                "page": page,
+                "content": content
+            })
+        return out
+
+    except Exception as e:
+        st.error(f"⚠️ Retrieval failed: {e}")
+        return []
+
+
+# ---- Small adjustments to agentic_chat and chat_with_rag to consume retrieve()'s list ----
+def agentic_chat(question: str, history: list, k: int = 5, max_tokens: int = 512):
+    """
+    Answer user query using retrieval-augmented generation (RAG).
+    Uses retrieve() which returns a list of context dicts.
+    """
+    # Step 1: Retrieve relevant context
+    ctx_list = retrieve(question, k=k)
+
+    # create a readable context string for the system prompt
+    if ctx_list:
+        context = "\n\n".join(f"[{c['pdf_name']} - page {c['page']}]: {c['content']}" for c in ctx_list)
+        system_prompt = f"""You are a helpful assistant. Use the retrieved context 
+        from the uploaded document to answer the user's question. 
+        If the context is insufficient, say so.
+
+        Retrieved context:
+        {context}
+        """
+    else:
+        system_prompt = "You are a helpful assistant. No relevant document context was found."
+
+    # Step 3: Format messages (history + new question)
+    msgs = [{"role": "system", "content": system_prompt}]
+    for h in history:
+        # history items are expected to be dicts with "question" and "answer" keys
+        msgs.append({"role": "user", "content": h["question"]})
+        msgs.append({"role": "assistant", "content": h["answer"]})
+    msgs.append({"role": "user", "content": question})
+
+    # Step 4: Call Databricks LLM endpoint
+    resp = client.predict(endpoint=CHAT_ENDPOINT, inputs={"messages": msgs, "max_tokens": max_tokens})
+    reply = resp.get("choices", [{}])[0].get("message", {}).get("content", "⚠️ No reply generated.")
+    return reply, ctx_list
+
 
 def chat_with_rag(question, history=None, **kwargs):
-    if AGENTIC_MODE: return agentic_chat(question, history, **kwargs)
-    ctx = retrieve(question, k=5)
-    system = "Answer using ONLY this context. If missing, say 'I don't know'.\n\n" + "\n---\n".join(c["content"] for c in ctx)
-    msgs = [{"role":"system","content":system}] + (history or []) + [{"role":"user","content":question}]
-    return call_llm(msgs), ctx
+    """
+    Wrapper that calls agentic_chat if AGENTIC_MODE else a simple RAG path.
+    Non-agentic path will also call retrieve() and format system prompt using the returned list.
+    """
+    if AGENTIC_MODE:
+        return agentic_chat(question, history or [], **kwargs)
+
+    ctx_list = retrieve(question, k=5)
+    if ctx_list:
+        system = "Answer using ONLY this context. If missing, say 'I don't know'.\n\n" + \
+                 "\n---\n".join(f"[{c['pdf_name']} - p.{c['page']}]: {c['content']}" for c in ctx_list)
+    else:
+        system = "Answer using ONLY this context. If missing, say 'I don't know'.\n\n" + "No context found."
+
+    # Here history should be a list of messages in the LLM API format or your previous format.
+    # Your existing code appended history as dicts with 'role' and 'content' for the chat UI.
+    # If your history items are the assistant/user chat history in LLM format already, use them directly.
+    msgs = [{"role": "system", "content": system}] + (history or []) + [{"role": "user", "content": question}]
+    return call_llm(msgs), ctx_list
 
 # --------------------
 # Streamlit UI
