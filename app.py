@@ -48,7 +48,6 @@ def get_user_info():
 
 user_info = get_user_info()
 
-# Initialize session state
 if "messages" not in st.session_state:
     st.session_state.messages = [
         {"role": "system", "content": "You are a helpful assistant in a Databricks app."}
@@ -56,10 +55,8 @@ if "messages" not in st.session_state:
 if "pdf_content" not in st.session_state:
     st.session_state.pdf_content = ""
 
-# App title
 st.title("🧱 Conversational AI Chatbot with PDF Support")
 
-# PDF uploader
 uploaded_file = st.file_uploader("📄 Upload a PDF for context", type=["pdf"])
 if uploaded_file:
     with pdfplumber.open(uploaded_file) as pdf:
@@ -67,7 +64,6 @@ if uploaded_file:
     st.session_state.pdf_content = pdf_text.strip()
     st.success("✅ PDF uploaded and processed successfully!")
 
-# Check endpoint compatibility
 if not endpoint_supported:
     st.error("⚠️ Unsupported Endpoint Type")
     st.markdown(
@@ -76,20 +72,16 @@ if not endpoint_supported:
 else:
     st.markdown("💬 Chat below. Your history will persist for the session.")
 
-    # Display chat history
     for message in st.session_state.messages:
-        if message["role"] != "system":  # don't display system prompt
+        if message["role"] != "system"
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
 
-    # User input
     if prompt := st.chat_input("Type your message"):
-        # Add user input to history
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        # Prepare context if PDF uploaded
         messages_to_send = st.session_state.messages.copy()
         if st.session_state.pdf_content:
             messages_to_send.insert(1, {
@@ -97,7 +89,6 @@ else:
                 "content": f"The user has uploaded a PDF. Here is its content:\n{st.session_state.pdf_content}"
             })
 
-        # Assistant response
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
                 assistant_reply = query_endpoint(
@@ -107,7 +98,6 @@ else:
                 )["content"]
                 st.markdown(assistant_reply)
 
-        # Save assistant reply to history
         st.session_state.messages.append({"role": "assistant", "content": assistant_reply})
 
 vsc = VectorSearchClient(disable_notice=True)
