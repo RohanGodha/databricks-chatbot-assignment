@@ -2,7 +2,6 @@ import os
 from dotenv import load_dotenv
 from databricks.sdk import WorkspaceClient
 from mlflow.deployments import get_deploy_client
-
 # Load environment variables from .env
 load_dotenv()
 
