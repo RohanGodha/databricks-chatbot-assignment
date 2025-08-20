@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from databricks import sql
 from databricks.vector_search.client import VectorSearchClient
 from mlflow.deployments import get_deploy_client
+import json
 
 # --------------------
 # Load ENV
@@ -86,13 +87,26 @@ def ensure_table_and_index(dim: int = 1024):
             raise
 
 def sync_index_safe():
-    """Trigger sync on TRIGGERED pipelines after new data is added."""
+    """
+    Trigger sync on TRIGGERED or CONTINUOUS pipeline indexes after new data is added.
+    Skips syncing for Direct Access indexes (immediate queryable).
+    """
     try:
-        st.info("Syncing index...")
-        vsc.get_index(VS_ENDPOINT, VS_INDEX).run()
-        st.success("Index sync triggered ✅")
+        st.info("Checking if index needs sync...")
+        idx = vsc.get_index(VS_ENDPOINT, VS_INDEX)
+
+        # Check the pipeline type of the index
+        pipeline_type = idx.get("pipeline_type", "DIRECT_ACCESS").upper()
+        if pipeline_type in ("TRIGGERED", "CONTINUOUS"):
+            # Trigger sync via the client
+            vsc.trigger_index_sync(endpoint_name=VS_ENDPOINT, index_name=VS_INDEX)
+            st.success(f"Index sync triggered ✅ (pipeline_type={pipeline_type})")
+        else:
+            st.info(f"Direct Access index → no sync needed (pipeline_type={pipeline_type})")
     except Exception as e:
         st.error(f"Failed to sync index: {e}")
+
+
 
 # --------------------
 # PDF ingestion
@@ -109,35 +123,129 @@ def chunk_text(text, max_chars=1200, overlap=200):
     return [c for c in chunks if c.strip()]
 
 def embed_chunks(chunks):
-    out = client.predict(endpoint=EMBEDDING_ENDPOINT, inputs={"input": chunks})
-    # st.write("DEBUG embedding response:", out) 
-    return [row.get("embedding", []) for row in out.get("data", [])]
+    """Embed a list of text chunks with debug logging and validation."""
+    if not chunks:
+        print("⚠️ No chunks provided to embed.")
+        return []
 
+    try:
+        st.write("DEBUG: EMBEDDING_ENDPOINT →", EMBEDDING_ENDPOINT)
+        st.write("DEBUG: first chunk to embed:", chunks[0][:50])
 
-def write_rows(rows):
-    conn = sql.connect(server_hostname=DB_HOST, http_path=DB_HTTP_PATH, access_token=DB_TOKEN)
-    with conn.cursor() as c:
-        c.executemany(f"INSERT INTO {DELTA_TABLE} VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
-    conn.close()
+        out = client.predict(endpoint=EMBEDDING_ENDPOINT, inputs={"input": chunks})
+        data = out.get("data", [])
+        embeddings = []
+        for idx, row in enumerate(data):
+            emb = row.get("embedding")
+            st.write(f"Chunk {idx} embedding length:", len(emb) if emb else 0)
+            if emb is None or len(emb) == 0:
+                print(f"⚠️ Embedding missing for chunk {idx}: {chunks[idx][:50]}...")
+                st.warning(f"⚠️ Chunk {idx} failed to embed. Text preview: {chunks[idx][:100]}...")
+            embeddings.append(emb or [])
+        return embeddings
+    except Exception as e:
+        print("❌ Error during embedding:", e)
+        return [[] for _ in chunks]
+
 
 def ingest_pdf(file_bytes, pdf_name):
-    doc_id, rows = str(uuid.uuid4()), []
+    """Ingest PDF, chunk text, generate embeddings, write to Delta table, and verify embeddings."""
+    import pdfplumber, uuid, datetime as dt
+    doc_id = str(uuid.uuid4())
+    rows = []
+
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        st.info(f"ℹ️ Processing PDF: {pdf_name}, total pages={len(pdf.pages)}")
         for pageno, page in enumerate(pdf.pages, 1):
             text = page.extract_text() or ""
+            if not text.strip():
+                st.warning(f"⚠️ Page {pageno} has no extractable text. Skipping.")
+                continue
+
             chunks = chunk_text(text)
-            if not chunks: continue
+            if not chunks:
+                st.warning(f"⚠️ Page {pageno}: no chunks generated after splitting.")
+                continue
+
             embs = embed_chunks(chunks)
+            if not embs or all(len(e) == 0 for e in embs):
+                st.warning(f"⚠️ Page {pageno}: all embeddings missing for {len(chunks)} chunks.")
+
             now = dt.datetime.now(dt.timezone.utc)
             for ch, emb in zip(chunks, embs):
                 rows.append((doc_id, pdf_name, pageno, str(uuid.uuid4()), ch, emb, now))
-    if rows: write_rows(rows)
-    sync_index_safe()  # auto sync index after ingestion
+    
+    if not rows:
+        st.error(f"❌ No rows to write for PDF: {pdf_name}")
+        return {"doc_id": doc_id, "chunks": 0}
+
+    # Write to Delta table
+    write_rows(rows)
+    st.success(f"✅ PDF ingested: {pdf_name}, total chunks={len(rows)}")
+
+    # Verify embeddings immediately after ingestion
+    verify_embeddings(pdf_name)
+
     return {"doc_id": doc_id, "chunks": len(rows)}
 
 
 
-# --------------------
+def write_rows(rows):
+    """Write chunked PDF + embeddings to Delta table safely."""
+    conn = sql.connect(server_hostname=DB_HOST, http_path=DB_HTTP_PATH, access_token=DB_TOKEN)
+    with conn.cursor() as c:
+        for r in rows:
+            # r[5] is embedding: should be list[float] or empty list
+            emb_list = r[5] if r[5] else []
+            c.execute(f"""INSERT INTO {DELTA_TABLE} 
+                (doc_id, pdf_name, page, chunk_id, content, embedding, created_at) 
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (r[0], r[1], r[2], r[3], r[4], emb_list, r[6])
+            )
+    conn.close()
+
+    
+
+
+
+def verify_embeddings(pdf_name=None, limit=5):
+    """
+    Verify embeddings in the Delta table using Python.
+    Checks for empty arrays or NULL embeddings.
+    Prints top rows and summary of missing embeddings.
+    """
+    conn = sql.connect(server_hostname=DB_HOST, http_path=DB_HTTP_PATH, access_token=DB_TOKEN)
+    with conn.cursor() as c:
+        query = f"SELECT pdf_name, page, chunk_id, embedding, content FROM {DELTA_TABLE}"
+        if pdf_name:
+            query += f" WHERE pdf_name = ?"
+            c.execute(query, (pdf_name,))
+        else:
+            c.execute(query)
+        rows = c.fetchall()
+
+    total = len(rows)
+    missing = 0
+    st.info(f"🔍 Verifying embeddings for PDF: {pdf_name or 'ALL PDFs'}")
+    for r in rows[:limit]:
+        emb = r[3]
+        emb_len = len(emb) if emb else 0
+        status = "✅" if emb_len > 0 else "⚠️ MISSING"
+        st.write(f"PDF={r[0]}, Page={r[1]}, Chunk={r[2]}, Embedding length={emb_len} {status}")
+        st.write(f"Content preview: {r[4][:100]}...\n")
+        if emb_len == 0:
+            missing += 1
+
+    # Count all missing embeddings
+    for r in rows:
+        emb = r[3]
+        if not emb or len(emb) == 0:
+            missing += 1
+
+    st.success(f"Total chunks: {total}, Chunks missing embeddings: {missing}")
+    conn.close()
+
+#------------------
 # Agentic Retriever
 # --------------------
 def retrieve(query, k=5):
@@ -164,6 +272,7 @@ def call_llm(messages, max_tokens=400):
     if "content" in resp: return resp["content"]
     return str(resp)[:2000]
 
+# ---- Replace/insert these helper functions ----
 # ---- Replace/insert these helper functions ----
 def embed_query_single(text):
     """
@@ -238,64 +347,84 @@ def retrieve(query: str, k: int = 5):
 def agentic_chat(question: str, history: list, k: int = 5, max_tokens: int = 512):
     """
     Answer user query using retrieval-augmented generation (RAG).
-    Uses retrieve() which returns a list of context dicts.
+    Works with Streamlit history format: {"role":"user"/"assistant","content":...}
     """
+
     # Step 1: Retrieve relevant context
     ctx_list = retrieve(question, k=k)
 
-    # create a readable context string for the system prompt
+    # Step 2: Build system prompt including retrieved context
     if ctx_list:
-        context = "\n\n".join(f"[{c['pdf_name']} - page {c['page']}]: {c['content']}" for c in ctx_list)
-        system_prompt = f"""You are a helpful assistant. Use the retrieved context 
-        from the uploaded document to answer the user's question. 
-        If the context is insufficient, say so.
-
-        Retrieved context:
-        {context}
-        """
+        context_text = "\n\n".join(f"[{c['pdf_name']} - page {c['page']}]: {c['content']}" for c in ctx_list)
+        system_prompt = (
+            "You are a helpful assistant. Use the retrieved context from the uploaded document "
+            "to answer the user's question. If the context is insufficient, say so.\n\n"
+            f"Retrieved context:\n{context_text}"
+        )
     else:
         system_prompt = "You are a helpful assistant. No relevant document context was found."
 
-    # Step 3: Format messages (history + new question)
+    # Step 3: Convert Streamlit history to LLM message format
     msgs = [{"role": "system", "content": system_prompt}]
     for h in history:
-        # history items are expected to be dicts with "question" and "answer" keys
-        msgs.append({"role": "user", "content": h["question"]})
-        msgs.append({"role": "assistant", "content": h["answer"]})
+        msgs.append({"role": h["role"], "content": h["content"]})
+
+    # Step 4: Append current question
     msgs.append({"role": "user", "content": question})
 
-    # Step 4: Call Databricks LLM endpoint
+    # Step 5: Call Databricks LLM endpoint
     resp = client.predict(endpoint=CHAT_ENDPOINT, inputs={"messages": msgs, "max_tokens": max_tokens})
     reply = resp.get("choices", [{}])[0].get("message", {}).get("content", "⚠️ No reply generated.")
     return reply, ctx_list
 
 
-def chat_with_rag(question, history=None, **kwargs):
+def chat_with_rag(question, history=None, k=5, max_tokens=512):
     """
     Wrapper that calls agentic_chat if AGENTIC_MODE else a simple RAG path.
-    Non-agentic path will also call retrieve() and format system prompt using the returned list.
+    Works with Streamlit history format: {"role":"user"/"assistant","content":...}
     """
+    history = history or []
+
     if AGENTIC_MODE:
-        return agentic_chat(question, history or [], **kwargs)
+        return agentic_chat(question, history, k=k, max_tokens=max_tokens)
 
-    ctx_list = retrieve(question, k=5)
+    # Step 1: Retrieve context from uploaded document
+    ctx_list = retrieve(question, k=k)
+
+    # Step 2: Build system prompt including retrieved context
     if ctx_list:
-        system = "Answer using ONLY this context. If missing, say 'I don't know'.\n\n" + \
-                 "\n---\n".join(f"[{c['pdf_name']} - p.{c['page']}]: {c['content']}" for c in ctx_list)
+        context_text = "\n\n".join(f"[{c['pdf_name']} - p.{c['page']}]: {c['content']}" for c in ctx_list)
+        system_prompt = (
+            "Answer using ONLY this context. If the context is insufficient, say 'I don't know'.\n\n"
+            f"Retrieved context:\n{context_text}"
+        )
     else:
-        system = "Answer using ONLY this context. If missing, say 'I don't know'.\n\n" + "No context found."
+        system_prompt = (
+            "Answer using ONLY this context. If the context is insufficient, say 'I don't know'.\n\n"
+            "No context found."
+        )
 
-    # Here history should be a list of messages in the LLM API format or your previous format.
-    # Your existing code appended history as dicts with 'role' and 'content' for the chat UI.
-    # If your history items are the assistant/user chat history in LLM format already, use them directly.
-    msgs = [{"role": "system", "content": system}] + (history or []) + [{"role": "user", "content": question}]
-    return call_llm(msgs), ctx_list
+    # Step 3: Convert Streamlit history to LLM message format
+    msgs = [{"role": "system", "content": system_prompt}]
+    for h in history:
+        msgs.append({"role": h["role"], "content": h["content"]})
+
+    # Step 4: Append current question
+    msgs.append({"role": "user", "content": question})
+
+    # Step 5: Call Databricks LLM endpoint
+    reply = call_llm(msgs, max_tokens=max_tokens)
+    return reply, ctx_list
 
 # --------------------
 # Streamlit UI
 # --------------------
 st.set_page_config(page_title="Databricks Agentic RAG", page_icon="🧠")
 st.title("🧠 Databricks Agentic RAG Chat")
+
+client = get_deploy_client("databricks")
+resp = client.predict(endpoint=EMBEDDING_ENDPOINT, inputs={"input": ["test"]})
+# st.write(resp)
 
 # ensure resources at startup
 ensure_table_and_index()
