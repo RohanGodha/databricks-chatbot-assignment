@@ -1,4 +1,18 @@
-.env
-.venv/
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.Python
+env/
+venv/
+ENV/
+*.env
+*.venv
+*.log
+
+# VSCode
+.vscode/

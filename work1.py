@@ -1,45 +1,56 @@
+This is the code, remember it in depth:
+
 """
 Databricks Agentic RAG — Robust Ingestion with Guaranteed Embeddings
 ---------------------------------------------------------------------
-This Streamlit app ingests PDFs, generates embeddings with a Databricks Serving endpoint,
-stores them **reliably** in Delta (VECTOR or ARRAY<FLOAT> with JSON→FROM_JSON), and
-exposes a RAG chat over Databricks Vector Search. It includes:
+Single-file Streamlit app that:
+• Uploads PDFs
+• Extracts/chunks text
+• Creates embeddings (Databricks OR OpenAI)
+• Stores safely into Delta (VECTOR or ARRAY<FLOAT> via JSON→FROM_JSON)
+• Builds/uses Databricks Vector Search (Direct Access preferred)
+• Runs a RAG chat
 
-• Auto-detection of VECTOR type support (falls back to ARRAY<FLOAT>)
-• Direct Access index by default (no sync needed); falls back to Delta-sync (TRIGGERED)
-• JSON-safe inserts for embeddings (fixes empty/NULL embeddings issue)
-• Strict dimension checks, padding/truncation, and detailed logs
-• Accurate verification (no double-counting)
-• Safe de-duplication by pdf_name (optional)
-• Agentic and simple RAG chat modes
+Fixes:
+• Empty/NULL embeddings via strict sanitization + JSON casting
+• Robust index metadata (.getattr)
+• Auto-detects VECTOR type, falls back to ARRAY<FLOAT>
+• Accurate verification
 
-Env (.env) expected:
-  CHAT_ENDPOINT=<databricks chat serving endpoint name>
-  EMBEDDING_ENDPOINT=<databricks embedding endpoint name>
+ENV (.env):
+  # Choose backend: DATABRICKS or OPENAI
+  BACKEND_PROVIDER=DATABRICKS
+
+  # Databricks config
   DATABRICKS_HOST=https://<your-workspace>.cloud.databricks.com
   DATABRICKS_TOKEN=<token>
   DATABRICKS_SQL_HTTP_PATH=/sql/1.0/warehouses/<id>
+
+  # Databricks Serving endpoints (used when BACKEND_PROVIDER=DATABRICKS)
+  CHAT_ENDPOINT=<databricks chat serving endpoint name>
+  EMBEDDING_ENDPOINT=<databricks embedding endpoint name>
+
+  # OpenAI config (used when BACKEND_PROVIDER=OPENAI)
+  OPENAI_API_KEY=<key>
+  OPENAI_EMBED_MODEL=text-embedding-3-small
+  OPENAI_CHAT_MODEL=gpt-4o-mini
+
+  # Data placement
   CATALOG=main
   SCHEMA=default
-  TABLE_NAME=pdf_text_embeddings     # optional, default used if missing
-  DELTA_TABLE=main.default.pdf_text_embeddings  # overrides CATALOG/SCHEMA/TABLE_NAME if set
-  VS_ENDPOINT=vs_endpoint_default    # optional (reused or created if missing)
+  TABLE_NAME=pdf_text_embeddings
+  DELTA_TABLE=main.default.pdf_text_embeddings
+  VS_ENDPOINT=vs_endpoint_default
   VS_INDEX=main.default.pdf_text_embeddings_index
-  AGENTIC_MODE=True|False            # optional
-  DEBUG_VERBOSE=True|False           # optional
 
-Run:
-  streamlit run databricks_agentic_rag_app.py
-
-Note: Rotate your tokens if they were ever exposed.
+  # Optional
+  AGENTIC_MODE=True
+  DEBUG_VERBOSE=True
 """
 
 import io
 import json
 import os
-import re
-import sys
-import time
 import uuid
 import typing as t
 import datetime as dt
@@ -51,45 +62,69 @@ from dotenv import load_dotenv
 from databricks import sql
 from databricks.vector_search.client import VectorSearchClient
 from mlflow.deployments import get_deploy_client
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
+from langchain_openai import ChatOpenAI
 
 # --------------------
 # Config & Globals
 # --------------------
 load_dotenv()
 
-CHAT_ENDPOINT = os.getenv("CHAT_ENDPOINT", "").strip()
-EMBEDDING_ENDPOINT = os.getenv("EMBEDDING_ENDPOINT", "").strip()
+BACKEND_PROVIDER = os.getenv("BACKEND_PROVIDER", "DATABRICKS").strip().upper()
+
+# Databricks
 DB_HOST = os.getenv("DATABRICKS_HOST", "").replace("https://", "").strip()
 DB_HTTP_PATH = os.getenv("DATABRICKS_SQL_HTTP_PATH", "").strip()
 DB_TOKEN = os.getenv("DATABRICKS_TOKEN", "").strip()
+CHAT_ENDPOINT = os.getenv("CHAT_ENDPOINT", "").strip()
+EMBEDDING_ENDPOINT = os.getenv("EMBEDDING_ENDPOINT", "").strip()
 
+# OpenAI
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small").strip()
+OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini").strip()
+
+# Data placement
 CATALOG = os.getenv("CATALOG", "main").strip()
 SCHEMA = os.getenv("SCHEMA", "default").strip()
 TABLE_NAME = os.getenv("TABLE_NAME", "pdf_text_embeddings").strip()
 DELTA_TABLE = os.getenv("DELTA_TABLE", f"{CATALOG}.{SCHEMA}.{TABLE_NAME}").strip()
 
-VS_ENDPOINT = os.getenv("VS_ENDPOINT", "").strip()  # may be reused if exists
+VS_ENDPOINT = os.getenv("VS_ENDPOINT", "").strip()
 VS_INDEX = os.getenv("VS_INDEX", f"{CATALOG}.{SCHEMA}.{TABLE_NAME}_index").strip()
 
 AGENTIC_MODE = os.getenv("AGENTIC_MODE", "False").lower().strip() == "true"
 DEBUG_VERBOSE = os.getenv("DEBUG_VERBOSE", "False").lower().strip() == "true"
 
-# Embedding dimension expected from endpoint — adjust if your model differs
+# Default dims (will probe)
 EMBED_DIM_DEFAULT = 1024
 
-# Will be set after table creation/probing
+# Will be set after probe
 USE_VECTOR_TYPE: bool = False
 VECTOR_DIM: int = EMBED_DIM_DEFAULT
 INDEX_MODE: str = "UNKNOWN"  # "DIRECT" or "SYNC"
 
-# Databricks clients
-client = get_deploy_client("databricks")
+# Clients
 vsc = VectorSearchClient()
 
-# --------------------
-# Utility logging
-# --------------------
+# Backends
+dbx_client = None
+oa_client = None
+if BACKEND_PROVIDER == "DATABRICKS":
+    dbx_client = get_deploy_client("databricks")
+elif BACKEND_PROVIDER == "OPENAI":
+    try:
+        from openai import OpenAI
+        oa_client = OpenAI(api_key=OPENAI_API_KEY or None)
+    except Exception as e:
+        raise RuntimeError(f"OPENAI selected but OpenAI SDK not available: {e}")
+else:
+    raise RuntimeError("BACKEND_PROVIDER must be DATABRICKS or OPENAI")
 
+# --------------------
+# Logging helpers
+# --------------------
 def log_debug(*args):
     if DEBUG_VERBOSE:
         try:
@@ -117,9 +152,8 @@ def log_error(*args):
         print("ERROR:", *args)
 
 # --------------------
-# DB Connection helper
+# DB connection
 # --------------------
-
 def db_connect():
     if not DB_HOST or not DB_HTTP_PATH or not DB_TOKEN:
         raise RuntimeError("Databricks SQL connection env vars are missing.")
@@ -128,9 +162,7 @@ def db_connect():
 # --------------------
 # Capability probing
 # --------------------
-
 def parse_catalog_schema_from_fqn(fqn: str) -> t.Tuple[str, str, str]:
-    """Return (catalog, schema, table) from an FQN or partially-qualified name."""
     parts = fqn.split(".")
     if len(parts) == 3:
         return parts[0], parts[1], parts[2]
@@ -138,9 +170,7 @@ def parse_catalog_schema_from_fqn(fqn: str) -> t.Tuple[str, str, str]:
         return CATALOG, parts[0], parts[1]
     return CATALOG, SCHEMA, parts[0]
 
-
 def supports_vector_type() -> bool:
-    """Create and drop a tiny probe table with VECTOR to detect support."""
     catalog, schema, _ = parse_catalog_schema_from_fqn(DELTA_TABLE)
     probe = f"{catalog}.{schema}.__vector_probe__{uuid.uuid4().hex[:6]}"
     conn = db_connect()
@@ -163,13 +193,12 @@ def supports_vector_type() -> bool:
 # --------------------
 # DDL & Index bootstrap
 # --------------------
-
 def ensure_table_and_index(dim: int = EMBED_DIM_DEFAULT):
     global USE_VECTOR_TYPE, VECTOR_DIM, VS_ENDPOINT, INDEX_MODE
 
     VECTOR_DIM = dim
 
-    # 1) Ensure table with VECTOR or ARRAY<FLOAT>
+    # 1) Table
     USE_VECTOR_TYPE = supports_vector_type()
     conn = db_connect()
     with conn.cursor() as c:
@@ -205,7 +234,7 @@ def ensure_table_and_index(dim: int = EMBED_DIM_DEFAULT):
             log_info(f"Ensured table with ARRAY<FLOAT>: {DELTA_TABLE}")
     conn.close()
 
-    # 2) Ensure VS endpoint (reuse existing if any)
+    # 2) VS endpoint
     endpoints = vsc.list_endpoints().get("endpoints", [])
     if endpoints:
         if not VS_ENDPOINT:
@@ -219,7 +248,7 @@ def ensure_table_and_index(dim: int = EMBED_DIM_DEFAULT):
         os.environ["VS_ENDPOINT"] = VS_ENDPOINT
         log_info(f"Created VS endpoint: {VS_ENDPOINT}")
 
-    # 3) Ensure index: try Direct Access first, fallback to Delta-sync (TRIGGERED)
+    # 3) Index (Direct Access → Delta-sync fallback)
     try:
         _ = vsc.get_index(VS_ENDPOINT, VS_INDEX)
         log_info(f"Index already exists: {VS_INDEX} ✅")
@@ -250,7 +279,7 @@ def ensure_table_and_index(dim: int = EMBED_DIM_DEFAULT):
         else:
             raise
 
-    # Determine index mode for later sync/query behavior
+    # Index mode
     try:
         idx = vsc.get_index(VS_ENDPOINT, VS_INDEX)
         pipeline_type = getattr(idx, "pipeline_type", "DIRECT_ACCESS").upper()
@@ -259,7 +288,6 @@ def ensure_table_and_index(dim: int = EMBED_DIM_DEFAULT):
     except Exception as e:
         log_warn("Could not determine index pipeline type:", e)
         INDEX_MODE = "UNKNOWN"
-
 
 def trigger_index_sync_if_needed():
     if INDEX_MODE == "SYNC":
@@ -271,101 +299,9 @@ def trigger_index_sync_if_needed():
     else:
         log_debug("No sync needed (Direct Access or unknown mode).")
 
-def extract_text_from_pdf(file) -> list[str]:
-    text_chunks = []
-    try:
-        pdf_reader = PyPDF2.PdfReader(file)
-        for page_num, page in enumerate(pdf_reader.pages):
-            text = page.extract_text()
-            if text:
-                # simple chunker: split by ~500 chars
-                for i in range(0, len(text), 500):
-                    chunk = text[i:i+500].strip()
-                    if chunk:
-                        text_chunks.append((page_num, chunk))
-        return text_chunks
-    except Exception as e:
-        st.error(f"❌ PDF extract failed: {e}")
-        return []      
-
-
-def embed_text_chunks(chunks: list[tuple[int, str]]) -> list[dict]:
-    rows = []
-    for page_num, chunk in chunks:
-        try:
-            resp = client.embeddings.create(
-                model=EMBEDDING_ENDPOINT,
-                input=chunk
-            )
-            embedding = resp.data[0].embedding if resp and resp.data else None
-            if not embedding:
-                st.warning(f"⚠️ Empty embedding for page {page_num}, skipping.")
-                continue
-            rows.append({
-                "id": str(uuid.uuid4()),
-                "page": page_num,
-                "chunk": chunk,
-                "embedding": embedding,
-            })
-        except Exception as e:
-            st.error(f"❌ Embedding failed for page {page_num}: {e}")
-    return rows
-
-
-# ------------------------------
-# Insert into Delta table
-# ------------------------------
-def insert_rows_into_table(pdf_name: str, rows: list[dict]):
-    try:
-        conn = sql.connect(server_hostname=DATABRICKS_HOST.replace("https://", ""),
-                           http_path="/sql/1.0/warehouses/<YOUR-WH-ID>",  # ⚠️ replace with your SQL Warehouse path
-                           access_token=DATABRICKS_TOKEN)
-        cursor = conn.cursor()
-
-        for row in rows:
-            cursor.execute(f"""
-                INSERT INTO {TABLE_NAME} (id, pdf_name, page_num, chunk, embedding)
-                VALUES (?, ?, ?, ?, ?)
-            """, (row["id"], pdf_name, row["page"], row["chunk"], row["embedding"]))
-
-        conn.commit()
-        cursor.close()
-        conn.close()
-        st.success(f"✅ Inserted {len(rows)} rows into {TABLE_NAME}")
-    except Exception as e:
-        st.error(f"❌ Failed inserting rows: {e}")
-
-
-def on_ingest(uploaded_file):
-    pdf_name = uploaded_file.name
-    st.info(f"📄 Processing {pdf_name}...")
-
-    # 1. Extract
-    chunks = extract_text_from_pdf(uploaded_file)
-    if not chunks:
-        st.error("❌ No text extracted from PDF.")
-        return
-
-    st.write(f"📑 Extracted {len(chunks)} chunks from PDF.")
-
-    # 2. Embed
-    rows = embed_text_chunks(chunks)
-    if not rows:
-        st.error("❌ No embeddings generated (all failed).")
-        return
-    st.write(f"🧠 Generated {len(rows)} embeddings.")
-
-    # 3. Insert
-    insert_rows_into_table(pdf_name, rows)
-
-    # 4. Small wait for index to catch up (DIRECT mode is instant, but add a pause)
-    time.sleep(2)
-    st.success("🚀 Ingestion complete. You can now query this PDF!")
-
 # --------------------
-# Chunking & Embedding
+# Chunking
 # --------------------
-
 def chunk_text(text: str, max_chars: int = 1200, overlap: int = 200, min_len: int = 20) -> t.List[str]:
     text = " ".join((text or "").split())
     if not text:
@@ -383,9 +319,10 @@ def chunk_text(text: str, max_chars: int = 1200, overlap: int = 200, min_len: in
         i = max(j - overlap, j)
     return chunks
 
-
+# --------------------
+# Embeddings (provider-agnostic)
+# --------------------
 def sanitize_vector(vec: t.Optional[t.List[float]], dim: int) -> t.List[float]:
-    """Ensure vector has exact length dim by truncation/padding. Returns [] if vec invalid."""
     if not isinstance(vec, list):
         return []
     v = [float(x) for x in vec if isinstance(x, (int, float))]
@@ -395,41 +332,47 @@ def sanitize_vector(vec: t.Optional[t.List[float]], dim: int) -> t.List[float]:
         return v
     if len(v) > dim:
         return v[:dim]
-    # pad with zeros
     return v + [0.0] * (dim - len(v))
 
+def _embed_databricks(texts: t.List[str]) -> t.List[t.List[float]]:
+    resp = dbx_client.predict(endpoint=EMBEDDING_ENDPOINT, inputs={"input": texts})
+    data = resp.get("data", [])
+    return [ (row.get("embedding") if isinstance(row, dict) else None) for row in data ]
+
+def _embed_openai(texts: t.List[str]) -> t.List[t.List[float]]:
+    # OpenAI returns in the request order
+    resp = oa_client.embeddings.create(model=OPENAI_EMBED_MODEL, input=texts)
+    return [d.embedding for d in resp.data]
 
 def embed_batch(texts: t.List[str], batch_size: int = 64, expected_dim: int = VECTOR_DIM) -> t.List[t.List[float]]:
-    """Embed texts in batches; always returns a list of vectors (possibly empty lists), never raises."""
-    embeddings: t.List[t.List[float]] = []
+    out: t.List[t.List[float]] = []
     if not texts:
-        return embeddings
-
-    log_info("EMBEDDING_ENDPOINT →", EMBEDDING_ENDPOINT)
-    log_debug("Total texts to embed:", len(texts))
-
-    for start in range(0, len(texts), batch_size):
-        batch = texts[start:start + batch_size]
+        return out
+    log_info("Embedding via", BACKEND_PROVIDER)
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i+batch_size]
         try:
-            resp = client.predict(endpoint=EMBEDDING_ENDPOINT, inputs={"input": batch})
-            data = resp.get("data", [])
-            if len(data) != len(batch):
-                log_warn(f"Embedding response size mismatch: expected {len(batch)}, got {len(data)}")
-            for i, row in enumerate(data):
-                raw = row.get("embedding") if isinstance(row, dict) else None
-                vec = sanitize_vector(raw, expected_dim)
-                embeddings.append(vec)
-                log_debug(f"Batch vec[{start + i}] len=", len(vec))
+            raw = _embed_openai(batch) if BACKEND_PROVIDER == "OPENAI" else _embed_databricks(batch)
+            if len(raw) != len(batch):
+                log_warn(f"Embedding response size mismatch: expected {len(batch)}, got {len(raw)}")
+            for r in raw:
+                out.append(sanitize_vector(r, expected_dim))
         except Exception as e:
             log_error("Embedding batch failed:", e)
-            # Fill with empties to keep ordering
-            embeddings.extend([[] for _ in batch])
-    return embeddings
+            out.extend([[] for _ in batch])
+    return out
+
+def embed_query_single(text: str) -> t.List[float]:
+    try:
+        raw = _embed_openai([text]) if BACKEND_PROVIDER == "OPENAI" else _embed_databricks([text])
+        return sanitize_vector((raw[0] if raw else []), VECTOR_DIM)
+    except Exception as e:
+        log_error("Query embedding failed:", e)
+        return []
 
 # --------------------
 # Ingestion & Write
 # --------------------
-
 def delete_existing_by_pdf_name(pdf_name: str):
     conn = db_connect()
     with conn.cursor() as c:
@@ -437,16 +380,10 @@ def delete_existing_by_pdf_name(pdf_name: str):
     conn.close()
     log_info(f"Removed existing rows for pdf_name='{pdf_name}' (if any)")
 
-
-
 def write_rows(rows: t.List[t.Tuple[str, str, int, str, str, t.List[float], dt.datetime]]):
-    """Robust insert: JSON → FROM_JSON → CAST(… AS VECTOR(dim)) or ARRAY<FLOAT>.
-    rows: (doc_id, pdf_name, page, chunk_id, content, embedding_list, created_at)
-    """
     if not rows:
         log_warn("write_rows called with empty rows")
         return
-
     conn = db_connect()
     with conn.cursor() as c:
         if USE_VECTOR_TYPE:
@@ -459,23 +396,16 @@ def write_rows(rows: t.List[t.Tuple[str, str, int, str, str, t.List[float], dt.d
             INSERT INTO {DELTA_TABLE} (doc_id, pdf_name, page, chunk_id, content, embedding, created_at)
             SELECT ?, ?, ?, ?, ?, CAST(from_json(?, 'array<float>') AS ARRAY<FLOAT>), ?
             """
-
         payload = []
         for r in rows:
             emb_json = json.dumps(r[5] or [])
             payload.append((r[0], r[1], r[2], r[3], r[4], emb_json, r[6]))
-            log_debug(
-                f"Row: doc_id={r[0]} page={r[2]} chunk_id={r[3][:8]}.. content_len={len(r[4])} emb_len={len(r[5]) if r[5] else 0}"
-            )
+            log_debug(f"Row: doc_id={r[0]} page={r[2]} chunk_id={r[3][:8]}.. content_len={len(r[4])} emb_len={len(r[5]) if r[5] else 0}")
         c.executemany(insert_sql, payload)
     conn.close()
     log_info(f"Inserted {len(rows)} rows into {DELTA_TABLE}")
 
-
 def verify_embeddings(pdf_name: t.Optional[str] = None, limit: int = 5):
-    """Accurate verification without double-counting.
-    For ARRAY: size(embedding); for VECTOR: vector_dims(embedding).
-    """
     conn = db_connect()
     with conn.cursor() as c:
         base = f"FROM {DELTA_TABLE}"
@@ -484,7 +414,6 @@ def verify_embeddings(pdf_name: t.Optional[str] = None, limit: int = 5):
             base += " WHERE pdf_name = ?"
             params = (pdf_name,)
 
-        # Preview rows
         if USE_VECTOR_TYPE:
             preview_sql = f"SELECT pdf_name, page, chunk_id, vector_dims(embedding) AS emb_dims, substr(content,1,160) AS preview {base} LIMIT {limit}"
         else:
@@ -498,7 +427,6 @@ def verify_embeddings(pdf_name: t.Optional[str] = None, limit: int = 5):
             st.write(f"PDF={r[0]}, Page={r[1]}, Chunk={r[2]}, Embedding dims={emb_dims} {status}")
             st.caption(f"Preview: {r[4]}…")
 
-        # Totals
         c.execute(f"SELECT count(*) {base}", params)
         total = c.fetchall()[0][0]
 
@@ -510,15 +438,10 @@ def verify_embeddings(pdf_name: t.Optional[str] = None, limit: int = 5):
                           f"SELECT count(*) FROM {DELTA_TABLE} WHERE embedding IS NULL OR size(embedding)=0"
         c.execute(missing_sql, params if pdf_name else tuple())
         missing = c.fetchall()[0][0]
-
     conn.close()
     st.success(f"Total chunks: {total}, Chunks missing embeddings: {missing}")
 
-
 def ingest_pdf(file_bytes: bytes, pdf_name: str, dedup: bool = True) -> t.Dict[str, t.Any]:
-    """Read PDF, chunk text, embed, and write rows. Guarantees stored vectors.
-    Returns {doc_id, chunks}.
-    """
     doc_id = str(uuid.uuid4())
     rows: t.List[t.Tuple[str, str, int, str, str, t.List[float], dt.datetime]] = []
 
@@ -538,11 +461,9 @@ def ingest_pdf(file_bytes: bytes, pdf_name: str, dedup: bool = True) -> t.Dict[s
                 log_warn(f"Page {pageno}: no chunks generated after splitting.")
                 continue
 
-            # Embed
             st.write(f"Embedding page {pageno} with {len(chunks)} chunks…")
             embs = embed_batch(chunks, batch_size=64, expected_dim=VECTOR_DIM)
 
-            # Strict guarantee: store vectors with exact length; empty vecs allowed but counted
             now = dt.datetime.now(dt.timezone.utc)
             for ch, emb in zip(chunks, embs):
                 clean = sanitize_vector(emb, VECTOR_DIM)
@@ -562,23 +483,9 @@ def ingest_pdf(file_bytes: bytes, pdf_name: str, dedup: bool = True) -> t.Dict[s
 # --------------------
 # Retrieval & Chat
 # --------------------
-
-def embed_query_single(text: str) -> t.List[float]:
-    try:
-        out = client.predict(endpoint=EMBEDDING_ENDPOINT, inputs={"input": [text]})
-        data = out.get("data", [])
-        if not data:
-            return []
-        return sanitize_vector(data[0].get("embedding"), VECTOR_DIM)
-    except Exception as e:
-        log_error("Query embedding failed:", e)
-        return []
-
-
 def retrieve(query: str, k: int = 5) -> t.List[t.Dict[str, t.Any]]:
     try:
         idx = vsc.get_index(VS_ENDPOINT, VS_INDEX)
-        # Try query_text first (if supported), else query_vector
         try:
             res = idx.similarity_search(
                 query_text=query,
@@ -586,6 +493,7 @@ def retrieve(query: str, k: int = 5) -> t.List[t.Dict[str, t.Any]]:
                 columns=["doc_id", "pdf_name", "page", "content"],
             )
         except Exception as e:
+            # Fallback to query_vector
             if any(s in str(e).lower() for s in ["query vector must be specified", "invalid_parameter_value", "resource_does_not_exist"]):
                 qv = embed_query_single(query)
                 res = idx.similarity_search(
@@ -596,32 +504,35 @@ def retrieve(query: str, k: int = 5) -> t.List[t.Dict[str, t.Any]]:
             else:
                 raise
         rows = res.get("result", {}).get("data_array", [])
-        out = []
-        for r in rows:
-            out.append({
-                "doc_id": r[0] if len(r) > 0 else None,
-                "pdf_name": r[1] if len(r) > 1 else None,
-                "page": r[2] if len(r) > 2 else None,
-                "content": r[3] if len(r) > 3 else "",
-            })
-        return out
+        return [{
+            "doc_id": r[0] if len(r) > 0 else None,
+            "pdf_name": r[1] if len(r) > 1 else None,
+            "page": r[2] if len(r) > 2 else None,
+            "content": r[3] if len(r) > 3 else "",
+        } for r in rows]
     except Exception as e:
         log_error("Retrieval failed:", e)
         return []
 
+def _chat_databricks(messages: t.List[dict], max_tokens: int) -> str:
+    resp = dbx_client.predict(endpoint=CHAT_ENDPOINT, inputs={"messages": messages, "max_tokens": max_tokens})
+    if "choices" in resp:
+        return resp["choices"][0]["message"]["content"]
+    if "content" in resp:
+        return resp["content"]
+    return str(resp)[:2000]
+
+def _chat_openai(messages: t.List[dict], max_tokens: int) -> str:
+    # Convert roles if needed: we already use OpenAI-compatible roles
+    resp = oa_client.chat.completions.create(model=OPENAI_CHAT_MODEL, messages=messages, max_tokens=max_tokens)
+    return resp.choices[0].message.content
 
 def call_llm(messages: t.List[dict], max_tokens: int = 400) -> str:
     try:
-        resp = client.predict(endpoint=CHAT_ENDPOINT, inputs={"messages": messages, "max_tokens": max_tokens})
-        if "choices" in resp:
-            return resp["choices"][0]["message"]["content"]
-        if "content" in resp:
-            return resp["content"]
-        return str(resp)[:2000]
+        return _chat_openai(messages, max_tokens) if BACKEND_PROVIDER == "OPENAI" else _chat_databricks(messages, max_tokens)
     except Exception as e:
         log_error("LLM call failed:", e)
         return "⚠️ LLM error. Please check logs."
-
 
 def agentic_chat(question: str, history: t.List[dict], k: int = 5, max_tokens: int = 512):
     ctx_list = retrieve(question, k=k)
@@ -635,57 +546,89 @@ def agentic_chat(question: str, history: t.List[dict], k: int = 5, max_tokens: i
     else:
         system_prompt = "You are a helpful assistant. No relevant document context was found."
 
-    msgs = [{"role": "system", "content": system_prompt}]
-    for h in history:
-        msgs.append({"role": h["role"], "content": h["content"]})
-    msgs.append({"role": "user", "content": question})
-
+    msgs = [{"role": "system", "content": system_prompt}, *history, {"role": "user", "content": question}]
     reply = call_llm(msgs, max_tokens=max_tokens)
     return reply, ctx_list
 
-
-def chat_with_rag(question: str, history: t.Optional[t.List[dict]] = None, k: int = 5, max_tokens: int = 512):
+def chat_with_rag(
+    question: str,
+    history: t.Optional[t.List[dict]] = None,
+    k: int = 5,
+    max_tokens: int = 512
+):
     history = history or []
     if AGENTIC_MODE:
         return agentic_chat(question, history, k=k, max_tokens=max_tokens)
 
+    # Retrieve context
     ctx_list = retrieve(question, k=k)
+
+    # Build strict system prompt
     if ctx_list:
-        context_text = "\n\n".join(f"[{c['pdf_name']} - p.{c['page']}]: {c['content']}" for c in ctx_list)
+        context_text = "\n\n".join(
+            f"[{c['pdf_name']} - p.{c['page']}]: {c['content']}"
+            for c in ctx_list
+        )
         system_prompt = (
-            "Answer using ONLY this context. If the context is insufficient, say 'I don't know'.\n\n"
+            "You are a STRICT document analysis assistant.\n"
+            "You MUST answer ONLY using the retrieved context below.\n"
+            "If the context does not contain the answer, you MUST reply with exactly: \"I don't know\".\n"
+            "Do NOT generate explanations, disclaimers, or assumptions.\n"
+            "Do NOT say 'this conversation just started'.\n\n"
             f"Retrieved context:\n{context_text}"
         )
     else:
         system_prompt = (
-            "Answer using ONLY this context. If the context is insufficient, say 'I don't know'.\n\n"
-            "No context found."
+            "You are a STRICT document analysis assistant.\n"
+            "No relevant context was found.\n"
+            "You MUST reply exactly with: \"I don't know\"."
         )
 
-    msgs = [{"role": "system", "content": system_prompt}]
-    for h in history:
-        msgs.append({"role": h["role"], "content": h["content"]})
-    msgs.append({"role": "user", "content": question})
+    # Build message history
+    msgs = [
+        {"role": "system", "content": system_prompt},
+        *history,
+        {"role": "user", "content": question}
+    ]
 
+    # Call the LLM
     reply = call_llm(msgs, max_tokens=max_tokens)
+
+    # 🔒 Hard post-check to enforce strictness
+    if not ctx_list:
+        reply = "I don't know"
+    elif not any(word.lower() in ctx_list[0]['content'].lower() for word in question.split()):
+        # if answer clearly not from retrieved chunks → enforce "I don't know"
+        reply = "I don't know"
+
     return reply, ctx_list
+
+# --------------------
+# Optional post-ingestion hook
+# --------------------
+def on_ingest(result: dict):
+    # You can extend this to auto-summarize the PDF, write metadata, etc.
+    log_debug("on_ingest called with:", result)
 
 # --------------------
 # Streamlit UI
 # --------------------
-
 st.set_page_config(page_title="Databricks Agentic RAG", page_icon="🧠")
 st.title("🧠 Databricks Agentic RAG Chat — Robust Embeddings")
 
-# Early sanity check against the embedding endpoint
+# Probe embedding dimension once
 try:
-    resp_test = client.predict(endpoint=EMBEDDING_ENDPOINT, inputs={"input": ["_probe_"]})
-    dim_probe = len((resp_test.get("data", [{}])[0] or {}).get("embedding", []) or [])
+    if BACKEND_PROVIDER == "OPENAI":
+        vec = _embed_openai(["_probe_"])
+        dim_probe = len(vec[0]) if vec and vec[0] else 0
+    else:
+        resp_test = dbx_client.predict(endpoint=EMBEDDING_ENDPOINT, inputs={"input": ["_probe_"]})
+        dim_probe = len((resp_test.get("data", [{}])[0] or {}).get("embedding", []) or [])
     if dim_probe:
         VECTOR_DIM = dim_probe
-        st.caption(f"Embedding endpoint OK • dimension={VECTOR_DIM}")
+        st.caption(f"Embedding endpoint OK • dimension={VECTOR_DIM} • provider={BACKEND_PROVIDER}")
     else:
-        st.caption("Embedding endpoint responded but no embedding vector found — will use default 1024.")
+        st.caption(f"Embedding probe returned no vector — using default {EMBED_DIM_DEFAULT}.")
 except Exception as e:
     st.warning(f"Embedding endpoint probe failed: {e}")
 
@@ -696,35 +639,29 @@ with st.sidebar:
     st.header("Upload PDF")
     f = st.file_uploader("Choose a PDF", type=["pdf"])
     dedup = st.checkbox("De-duplicate rows for same PDF name before ingest", value=True)
+
     if st.button("Ingest", disabled=not f):
         r = ingest_pdf(f.read(), f.name, dedup=dedup)
         if INDEX_MODE == "SYNC":
             st.success(f"Ingested {r['chunks']} chunks (doc_id={r['doc_id']}) and index sync triggered ✅")
         else:
             st.success(f"Ingested {r['chunks']} chunks (doc_id={r['doc_id']}) ✅ (Direct Access)")
-        
-        # call the hook
         on_ingest(r)
 
     st.divider()
     st.subheader("Index Info")
     try:
         idx_obj = vsc.get_index(VS_ENDPOINT, VS_INDEX)
-
-        # Convert the object into a dict safely
         idx_meta = {
             "endpoint": VS_ENDPOINT,
             "index": VS_INDEX,
             "status": getattr(idx_obj, "status", "?"),
-            "pipeline_type": getattr(idx_obj, "pipeline_type", "N/A"),  # only exists for delta-sync
+            "pipeline_type": getattr(idx_obj, "pipeline_type", "DIRECT_ACCESS"),
             "last_sync": getattr(idx_obj, "last_successful_write_time_ms", None),
         }
-
         st.json(idx_meta)
-
     except Exception as e:
         st.write("Index meta unavailable:", str(e))
-
 
 # Chat history
 if "history" not in st.session_state:
