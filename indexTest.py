@@ -1,46 +1,66 @@
 from databricks.sdk import WorkspaceClient
-
 w = WorkspaceClient()
 
-ENDPOINT = "vs_endpoint_default"
-INDEX_NAME = "main.default.pdf_text_embeddings_index"
+idx = w.vector_search_indexes.get_index("main.default.pdf_text_embeddings_index")
+print(idx)
 
-def main():
-    print("🔎 Listing indexes under endpoint:", ENDPOINT)
-    indexes = w.vector_search_indexes.list_indexes(endpoint_name=ENDPOINT)
+# from databricks.sdk import WorkspaceClient
+# from databricks.sdk.errors.platform import InvalidParameterValue
 
-    found = False
-    for idx in indexes:
-        found = True
-        print(f"- Name: {idx.name}, Type: {idx.index_type}")
+# w = WorkspaceClient()
 
-    if not found:
-        print("⚠️ No indexes found under this endpoint.")
+# ENDPOINT = "vs_endpoint_default"
+# INDEX_NAME = "main.default.pdf_text_embeddings_index"
 
-    print("\n📂 Scanning rows from index:", INDEX_NAME)
-    rows = w.vector_search_indexes.scan_index(
-        index_name=INDEX_NAME,
-        max_results=5  # ✅ removed 'endpoint_name'
-    )
 
-    if not rows.data:
-        print("⚠️ No rows found in index (maybe ingestion didn’t work).")
-    else:
-        for r in rows.data:
-            print(r)
+# def main():
+#     print("🔎 Listing indexes under endpoint:", ENDPOINT)
+#     indexes = w.vector_search_indexes.list_indexes(endpoint_name=ENDPOINT)
 
-    print("\n💬 Running test query on index...")
-    query = w.vector_search_indexes.query_index(
-        index_name=INDEX_NAME,
-        query_text="Summarize the document",
-        num_results=3  # ✅ removed 'endpoint_name'
-    )
+#     found = False
+#     for idx in indexes:
+#         found = True
+#         print(f"- Name: {idx.name}, Type: {idx.index_type}")
 
-    if not query.results:
-        print("⚠️ No results returned for query.")
-    else:
-        for res in query.results:
-            print(res)
+#     if not found:
+#         print("⚠️ No indexes found under this endpoint.")
+#         return
 
-if __name__ == "__main__":
-    main()
+#     print("\n📂 Scanning rows from index:", INDEX_NAME)
+#     rows = w.vector_search_indexes.scan_index(
+#         index_name=INDEX_NAME,
+#         num_results=5
+#     )
+
+#     if not rows.data:
+#         print("⚠️ No rows found in index (maybe ingestion didn’t work).")
+#         return
+
+#     for r in rows.data:
+#         print("Row:", r)
+
+#     print("\n💬 Running test query on index...")
+#     try:
+#         query = w.vector_search_indexes.query_index(
+#             index_name=INDEX_NAME,
+#             query_text="Summarize the document",
+#             columns=["text"],
+#             num_results=3
+#         )
+#         print("✅ Query executed successfully")
+
+#         if not query.results:
+#             print("⚠️ No results returned for query.")
+#         else:
+#             for res in query.results:
+#                 print(res)
+
+#     except InvalidParameterValue as e:
+#         print("❌ Query failed:", e)
+#         print("👉 This usually means the index is a **direct access index**.")
+#         print("   In that case you must pass an embedding vector instead of query_text.")
+#         print("   Example: use your embedding model to create a vector, then query with `query_vector=[...]`.")
+
+
+# if __name__ == "__main__":
+#     main()
