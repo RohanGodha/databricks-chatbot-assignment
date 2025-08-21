@@ -121,6 +121,16 @@ else:
 INDEX = faiss.IndexFlatIP(DIM)  
 DOC_STORE = []
 
+# At the top of your script, after the global declarations:
+if "doc_store" not in st.session_state:
+    st.session_state.doc_store = []
+if "faiss_index" not in st.session_state:
+    st.session_state.faiss_index = faiss.IndexFlatIP(DIM)
+
+# Then update all references:
+DOC_STORE = st.session_state.doc_store
+INDEX = st.session_state.faiss_index
+
 # Clients
 vsc = VectorSearchClient()
 
@@ -318,24 +328,105 @@ def trigger_index_sync_if_needed():
 # --------------------
 # Chunking
 # --------------------
-def chunk_text(text: str, max_chars: int = 1200, overlap: int = 200, min_len: int = 20) -> t.List[str]:
-    text = " ".join((text or "").split())
-    if not text:
+# def chunk_text(text: str, max_chars: int = 1200, overlap: int = 200, min_len: int = 20) -> t.List[str]:
+#     text = " ".join((text or "").split())
+#     if not text:
+#         return []
+#     chunks: t.List[str] = []
+#     i = 0
+#     n = len(text)
+#     while i < n:
+#         j = min(i + max_chars, n)
+#         k = text.rfind(" ", i + max_chars - 200, j)
+#         j = k if k != -1 else j
+#         piece = text[i:j]
+#         if piece and len(piece.strip()) >= min_len:
+#             chunks.append(piece.strip())
+#         i = max(j - overlap, j)
+#     return chunks
+
+
+# def chunk_text(text: str, max_chars: int = 800, overlap: int = 150, min_len: int = 50) -> t.List[str]:
+#     """Better chunking with sentence awareness"""
+#     if not text or not text.strip():
+#         return []
+    
+#     # Clean the text first
+#     text = re.sub(r'\s+', ' ', text.strip())
+    
+#     chunks = []
+#     start = 0
+#     n = len(text)
+    
+#     while start < n:
+#         # Try to find a good break point (sentence end, paragraph, etc.)
+#         end = start + max_chars
+        
+#         # Don't break in the middle of a word if possible
+#         if end < n:
+#             # Look for sentence endings first
+#             for break_char in ['. ', '! ', '? ', '\n', '; ']:
+#                 break_pos = text.rfind(break_char, start + min_len, end)
+#                 if break_pos != -1:
+#                     end = break_pos + len(break_char.strip())
+#                     break
+#             else:
+#                 # Fallback: break at word boundary
+#                 space_pos = text.rfind(' ', start + min_len, end)
+#                 if space_pos != -1:
+#                     end = space_pos + 1
+        
+#         chunk = text[start:end].strip()
+#         if chunk and len(chunk) >= min_len:
+#             chunks.append(chunk)
+        
+#         # Move start position, considering overlap
+#         start = end - overlap if (end - overlap) > start else end
+#         if start >= n:
+#             break
+    
+#     return chunks
+
+def chunk_text(text: str, max_chars: int = 800, overlap: int = 150, min_len: int = 50) -> t.List[str]:
+    """Better chunking with sentence awareness"""
+    if not text or not text.strip():
         return []
-    chunks: t.List[str] = []
-    i = 0
+    
+    # Clean the text first
+    text = re.sub(r'\s+', ' ', text.strip())
+    
+    chunks = []
+    start = 0
     n = len(text)
-    while i < n:
-        j = min(i + max_chars, n)
-        k = text.rfind(" ", i + max_chars - 200, j)
-        j = k if k != -1 else j
-        piece = text[i:j]
-        if piece and len(piece.strip()) >= min_len:
-            chunks.append(piece.strip())
-        i = max(j - overlap, j)
+    
+    while start < n:
+        # Try to find a good break point
+        end = start + max_chars
+        
+        # Don't break in the middle of a word if possible
+        if end < n:
+            # Look for natural break points
+            for break_char in ['. ', '! ', '? ', '\n\n', '\n', '; ', ', ']:
+                break_pos = text.rfind(break_char, start + min_len, end)
+                if break_pos != -1:
+                    end = break_pos + len(break_char.strip())
+                    break
+            else:
+                # Fallback: break at word boundary
+                space_pos = text.rfind(' ', start + min_len, end)
+                if space_pos != -1:
+                    end = space_pos + 1
+        
+        chunk = text[start:end].strip()
+        if chunk and len(chunk) >= min_len:
+            chunks.append(chunk)
+        
+        # Move start position, considering overlap
+        start = end - overlap if (end - overlap) > start else end
+        if start >= n:
+            break
+    
     return chunks
-
-
 
 # --------------------
 # Embeddings (provider-agnostic)
@@ -465,11 +556,8 @@ def verify_embeddings(pdf_name: t.Optional[str] = None, limit: int = 5):
 # PDF Ingestion
 # ----------------------------
 def ingest_pdf(pdf_input: t.Union[str, bytes], pdf_name: str, dedup: bool = True, chunk_size: int = 500, batch_size: int = 64):
-    """
-    Ingest a PDF (path or bytes or file-like), chunk it, embed in batches, write to Delta table,
-    populate in-memory FAISS index + DOC_STORE for immediate retrieval, and trigger index sync if needed.
-    Returns: {"doc_id": ..., "pages": <pages>, "chunks": <chunks_indexed>}
-    """
+    global INDEX, DOC_STORE
+    
     import tempfile
     from PyPDF2 import PdfReader
 
@@ -503,45 +591,51 @@ def ingest_pdf(pdf_input: t.Union[str, bytes], pdf_name: str, dedup: bool = True
         except Exception:
             log_warn("Could not delete existing rows for dedup. Continuing...")
 
-    # Read and chunk pages
-    reader = PdfReader(tmp_path)
-    per_page_chunks: t.List[t.Tuple[int, str]] = []
-    for page_num, page in enumerate(reader.pages, start=1):
-        text = page.extract_text() or ""
-        if not text.strip():
-            continue
-        # simple chunking - reuse your chunk_text() function if desired
-        print("DEBUG type(chunk_text):", type(chunk_text))
-        chunks = chunk_text(text, max_chars=chunk_size, overlap=200, min_len=20)
-        for ch in chunks:
-            per_page_chunks.append((page_num, ch))
+    # Extract text with better method
+    full_text = extract_text_from_pdf(tmp_path)
+    
+    if not full_text.strip():
+        if created_tmp:
+            try: os.remove(tmp_path)
+            except: pass
+        return {"doc_id": doc_id, "pages": 0, "chunks": 0}
 
-    total_chunks = len(per_page_chunks)
+    # Chunk the entire document text with improved chunking
+    chunks = chunk_text(full_text, max_chars=chunk_size, overlap=150, min_len=50)
+    
+    total_chunks = len(chunks)
     if total_chunks == 0:
         if created_tmp:
             try: os.remove(tmp_path)
             except: pass
         return {"doc_id": doc_id, "pages": 0, "chunks": 0}
 
+    # Get total pages for metadata
+    reader = PdfReader(tmp_path)
+    total_pages = len(reader.pages)
+
     # Batch-embed and prepare rows for write_rows
     rows_to_write: t.List[t.Tuple[str, str, int, str, str, t.List[float], dt.datetime]] = []
     faiss_vectors: t.List[np.ndarray] = []
 
     for i in range(0, total_chunks, batch_size):
-        batch = per_page_chunks[i:i + batch_size]
-        texts = [b[1] for b in batch]
+        batch_chunks = chunks[i:i + batch_size]
         # get embeddings (provider-agnostic)
-        emb_batch = embed_batch(texts, batch_size=batch_size, expected_dim=VECTOR_DIM)
+        emb_batch = embed_batch(batch_chunks, batch_size=len(batch_chunks), expected_dim=VECTOR_DIM)
 
-        for (page_num, chunk_str), emb in zip(batch, emb_batch):
+        for chunk_idx, (chunk_str, emb) in enumerate(zip(batch_chunks, emb_batch)):
             # Ensure we have a vector of length VECTOR_DIM. If service returned None/empty, replace with zeros.
             if not isinstance(emb, list) or len(emb) == 0:
                 log_warn("Empty embedding received for a chunk — filling zeros to avoid null embeddings")
                 emb = [0.0] * VECTOR_DIM
+            
             # cast floats
             emb = [float(x) for x in emb]
             chunk_id = str(uuid.uuid4())
-            created_at = dt.datetime.utcnow()
+            created_at = dt.datetime.now(dt.timezone.utc)
+            
+            # Use page 1 for all chunks since we're chunking the whole document
+            page_num = 1
             rows_to_write.append((doc_id, pdf_name, page_num, chunk_id, chunk_str, emb, created_at))
 
             # prepare normalized vector for FAISS / in-memory retrieval
@@ -549,37 +643,48 @@ def ingest_pdf(pdf_input: t.Union[str, bytes], pdf_name: str, dedup: bool = True
             norm = np.linalg.norm(vec)
             if norm > 0:
                 vec = vec / norm
+            else:
+                # If vector has zero norm, use a small random vector to avoid issues
+                vec = np.random.rand(VECTOR_DIM).astype(np.float32) * 0.001
+            
             faiss_vectors.append(vec)
 
             # also append to in-memory DOC_STORE for immediate use
-            DOC_STORE.append({
+            doc_store_item = {
                 "doc_id": doc_id,
                 "pdf_name": pdf_name,
                 "page": page_num,
                 "chunk_id": chunk_id,
                 "content": chunk_str,
-                "embedding": vec.tolist()  # store normalized for scoring
-            })
-            print("DOC_STORE size:", len(DOC_STORE))
-            print("DOC_STORE doc_id is:", DOC_STORE[-1]["doc_id"])
-            print("DOC_STORE chunk_id is:", DOC_STORE[-1]["chunk_id"])
-            print("DOC_STORE content is:", DOC_STORE[-1]["content"])
-            print("DOC_STORE embedding's length is:", len(DOC_STORE[-1]["embedding"]))
+                "embedding": vec.tolist()
+            }
+            DOC_STORE.append(doc_store_item)
+            
+            if DEBUG_VERBOSE:
+                print(f"DOC_STORE size: {len(DOC_STORE)}")
+                print(f"Added item - doc_id: {doc_store_item['doc_id']}")
+                print(f"Added item - chunk_id: {doc_store_item['chunk_id']}")
+                print(f"Added item - content: {doc_store_item['content'][:100]}...")
 
-
-
-
-    # Write rows to Delta table in batches using existing helper (it JSON-casts embeddings)
-    # write_rows expects list of tuples (doc_id, pdf_name, page, chunk_id, content, embedding_list, created_at)
-    # We write in batches to avoid overly large transactions
+    # Write rows to Delta table in batches using existing helper
     batch_write_size = 256
     for i in range(0, len(rows_to_write), batch_write_size):
         write_rows(rows_to_write[i:i + batch_write_size])
 
     # Add all prepared vectors to FAISS (stacked add)
     if faiss_vectors:
-        stack = np.vstack(faiss_vectors).astype("float32")
-        INDEX.add(stack)
+        try:
+            stack = np.vstack(faiss_vectors).astype("float32")
+            INDEX.add(stack)
+            print(f"DEBUG: Added {len(faiss_vectors)} vectors to FAISS index. Total index size: {INDEX.ntotal}")
+        except Exception as e:
+            log_error(f"Failed to add vectors to FAISS: {e}")
+            # Recreate index
+            INDEX = faiss.IndexFlatIP(VECTOR_DIM)
+            if faiss_vectors:
+                stack = np.vstack(faiss_vectors).astype("float32")
+                INDEX.add(stack)
+                print(f"DEBUG: Recreated FAISS index and added {len(faiss_vectors)} vectors")
 
     # Trigger index sync if needed (for delta-sync mode)
     trigger_index_sync_if_needed()
@@ -591,9 +696,192 @@ def ingest_pdf(pdf_input: t.Union[str, bytes], pdf_name: str, dedup: bool = True
         except Exception:
             pass
 
-    return {"doc_id": doc_id, "pages": max(1, len(reader.pages)), "chunks": len(rows_to_write)}
+    print(f"Final DOC_STORE size: {len(DOC_STORE)}")
+    print(f"Final INDEX size: {INDEX.ntotal}")
+    return {"doc_id": doc_id, "pages": total_pages, "chunks": len(rows_to_write)}
+
+# def ingest_pdf(pdf_input: t.Union[str, bytes], pdf_name: str, dedup: bool = True, chunk_size: int = 500, batch_size: int = 64):
+#     """
+#     Ingest a PDF (path or bytes or file-like), chunk it, embed in batches, write to Delta table,
+#     populate in-memory FAISS index + DOC_STORE for immediate retrieval, and trigger index sync if needed.
+#     Returns: {"doc_id": ..., "pages": <pages>, "chunks": <chunks_indexed>}
+#     """
+#     import tempfile
+#     from PyPDF2 import PdfReader
+#     global INDEX, DOC_STORE 
+
+#     # create a single doc_id for this PDF
+#     doc_id = str(uuid.uuid4())
+
+#     # ----- accept bytes / file-like / path -----
+#     tmp_path = None
+#     created_tmp = False
+#     if isinstance(pdf_input, (bytes, bytearray)):
+#         tf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+#         tf.write(pdf_input)
+#         tf.close()
+#         tmp_path = tf.name
+#         created_tmp = True
+#     elif hasattr(pdf_input, "read"):  # streamlit UploadedFile
+#         tf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+#         tf.write(pdf_input.read())
+#         tf.close()
+#         tmp_path = tf.name
+#         created_tmp = True
+#     elif isinstance(pdf_input, str) and os.path.exists(pdf_input):
+#         tmp_path = pdf_input
+#     else:
+#         raise ValueError("pdf_input must be bytes, file-like, or a valid file path")
+
+#     # Optional dedup: remove previous rows for same pdf_name
+#     if dedup:
+#         try:
+#             delete_existing_by_pdf_name(pdf_name)
+#         except Exception:
+#             log_warn("Could not delete existing rows for dedup. Continuing...")
+
+#     # Extract text with better method
+#     full_text = extract_text_from_pdf(tmp_path)
+    
+#     if not full_text.strip():
+#         if created_tmp:
+#             try: os.remove(tmp_path)
+#             except: pass
+#         return {"doc_id": doc_id, "pages": 0, "chunks": 0}
+
+#     # Chunk the entire document text with improved chunking
+#     chunks = chunk_text(full_text, max_chars=chunk_size, overlap=150, min_len=50)
+    
+#     total_chunks = len(chunks)
+#     if total_chunks == 0:
+#         if created_tmp:
+#             try: os.remove(tmp_path)
+#             except: pass
+#         return {"doc_id": doc_id, "pages": 0, "chunks": 0}
+
+#     # Get total pages for metadata
+#     reader = PdfReader(tmp_path)
+#     total_pages = len(reader.pages)
+
+#     # Batch-embed and prepare rows for write_rows
+#     rows_to_write: t.List[t.Tuple[str, str, int, str, str, t.List[float], dt.datetime]] = []
+#     faiss_vectors: t.List[np.ndarray] = []
+
+#     for i in range(0, total_chunks, batch_size):
+#         batch_chunks = chunks[i:i + batch_size]
+#         # get embeddings (provider-agnostic)
+#         emb_batch = embed_batch(batch_chunks, batch_size=len(batch_chunks), expected_dim=VECTOR_DIM)
+
+#         for chunk_idx, (chunk_str, emb) in enumerate(zip(batch_chunks, emb_batch)):
+#             # Ensure we have a vector of length VECTOR_DIM. If service returned None/empty, replace with zeros.
+#             if not isinstance(emb, list) or len(emb) == 0:
+#                 log_warn("Empty embedding received for a chunk — filling zeros to avoid null embeddings")
+#                 emb = [0.0] * VECTOR_DIM
+            
+#             # cast floats
+#             emb = [float(x) for x in emb]
+#             chunk_id = str(uuid.uuid4())
+#             created_at = dt.datetime.now(dt.timezone.utc)  # Use timezone-aware datetime
+            
+#             # Use page 1 for all chunks since we're chunking the whole document
+#             page_num = 1
+#             rows_to_write.append((doc_id, pdf_name, page_num, chunk_id, chunk_str, emb, created_at))
+
+#             # prepare normalized vector for FAISS / in-memory retrieval
+#             vec = np.array(emb, dtype=np.float32)
+#             norm = np.linalg.norm(vec)
+#             if norm > 0:
+#                 vec = vec / norm
+#             else:
+#                 # If vector has zero norm, use a small random vector to avoid issues
+#                 vec = np.random.rand(VECTOR_DIM).astype(np.float32) * 0.001
+            
+#             faiss_vectors.append(vec)
+
+#             # also append to in-memory DOC_STORE for immediate use
+#             doc_store_item = {
+#                 "doc_id": doc_id,
+#                 "pdf_name": pdf_name,
+#                 "page": page_num,
+#                 "chunk_id": chunk_id,
+#                 "content": chunk_str,
+#                 "embedding": vec.tolist()  # store normalized for scoring
+#             }
+#             DOC_STORE.append(doc_store_item)
+            
+#             if DEBUG_VERBOSE:
+#                 print(f"DOC_STORE size: {len(DOC_STORE)}")
+#                 print(f"DOC_STORE doc_id: {doc_store_item['doc_id']}")
+#                 print(f"DOC_STORE chunk_id: {doc_store_item['chunk_id']}")
+#                 print(f"DOC_STORE content preview: {doc_store_item['content'][:100]}...")
+#                 print(f"DOC_STORE embedding length: {len(doc_store_item['embedding'])}")
+#                 print(f"DOC_STORE object id: {id(DOC_STORE)}") 
+#     # Write rows to Delta table in batches using existing helper
+#     batch_write_size = 256
+#     for i in range(0, len(rows_to_write), batch_write_size):
+#         write_rows(rows_to_write[i:i + batch_write_size])
+
+#     # Add all prepared vectors to FAISS (stacked add)
+#     if faiss_vectors:
+#         try:
+#             stack = np.vstack(faiss_vectors).astype("float32")
+#             INDEX.add(stack)
+#             print(f"DEBUG: Added {len(faiss_vectors)} vectors to FAISS index. Total index size: {INDEX.ntotal}")
+#         except Exception as e:
+#             log_error(f"Failed to add vectors to FAISS: {e}")
+#             # Try to recreate index if there's an issue
+#             # Remove the global declaration since INDEX is already a global variable
+#             # global INDEX
+#             INDEX = faiss.IndexFlatIP(VECTOR_DIM)
+#             if faiss_vectors:
+#                 stack = np.vstack(faiss_vectors).astype("float32")
+#                 INDEX.add(stack)
+#                 print(f"DEBUG: Recreated FAISS index and added {len(faiss_vectors)} vectors")
+
+#     # Trigger index sync if needed (for delta-sync mode)
+#     trigger_index_sync_if_needed()
+
+#     # cleanup temp file if we created one
+#     if created_tmp and tmp_path and os.path.exists(tmp_path):
+#         try:
+#             os.remove(tmp_path)
+#         except Exception:
+#             pass
+
+#     return {"doc_id": doc_id, "pages": total_pages, "chunks": len(rows_to_write)}
 
 
+
+
+def extract_text_from_pdf(pdf_path: str) -> str:
+    """Better PDF text extraction using pdfplumber"""
+    text = ""
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                # Try multiple extraction strategies
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
+                else:
+                    # Fallback: extract tables
+                    tables = page.extract_tables()
+                    for table in tables:
+                        for row in table:
+                            text += " ".join([str(cell) for cell in row if cell]) + "\n"
+    except Exception as e:
+        log_error(f"PDF extraction error: {e}")
+        # Fallback to PyPDF2 if pdfplumber fails
+        try:
+            from PyPDF2 import PdfReader
+            reader = PdfReader(pdf_path)
+            for page in reader.pages:
+                page_text = page.extract_text() or ""
+                text += page_text + "\n"
+        except Exception as e2:
+            log_error(f"PyPDF2 extraction also failed: {e2}")
+    
+    return text
 
 
 
@@ -630,37 +918,60 @@ def _question_context_overlap(question: str, ctx: str, ctx_emb: t.Optional[t.Lis
 # Retrieval & Chat
 # --------------------
 def retrieve(question: str, k: int = 5):
-    """
-    Retrieve top-k chunks from in-memory FAISS + DOC_STORE (populated at upload).
-    Note: this returns [] if no DOC_STORE (i.e., no in-memory ingestion yet).
-    """
+    """Retrieve top-k chunks from in-memory FAISS + DOC_STORE"""
+    global DOC_STORE, INDEX
+    
+    print(f"DEBUG: DOC_STORE object id: {id(DOC_STORE)}, length: {len(DOC_STORE)}")
+    print(f"DEBUG: INDEX object id: {id(INDEX)}, ntotal: {INDEX.ntotal}")
     if len(DOC_STORE) == 0:
+        print("DEBUG: DOC_STORE is empty")
+        try:
+            from __main__ import DOC_STORE as main_doc_store
+            print(f"DEBUG: Main DOC_STORE length: {len(main_doc_store)}")
+            DOC_STORE = main_doc_store
+        except:
+            pass        
         return []
 
     q_emb = embed_query_single(question)
     if not q_emb or len(q_emb) == 0:
+        print("DEBUG: Query embedding failed or is empty")
         return []
 
     q_vec = np.array(q_emb, dtype=np.float32)
     norm = np.linalg.norm(q_vec)
     if norm > 0:
         q_vec = q_vec / norm
+    else:
+        print("DEBUG: Query vector has zero norm")
+        return []
 
-    D, I = INDEX.search(np.array([q_vec], dtype=np.float32), k)
-    print("FAISS index size:", INDEX.ntotal)
+    print(f"DEBUG: FAISS index size: {INDEX.ntotal}, DOC_STORE size: {len(DOC_STORE)}")
+    
+    # Check if index has vectors
+    if INDEX.ntotal == 0:
+        print("DEBUG: FAISS index is empty")
+        return []
 
-
-    retrieved = []
-    for score, idx in zip(D[0], I[0]):
-        if idx == -1 or idx >= len(DOC_STORE):
-            continue
-        ctx = DOC_STORE[int(idx)]
-        ctx_score = _question_context_overlap(question, ctx["content"], ctx_emb=ctx.get("embedding"))
-        print("ctx_score = _question_context_overlap(question, ctx[""content""], ctx_emb=ctx.get(""embedding""))", ctx_score)
-        retrieved.append({**ctx, "score": float(ctx_score)})
-
-    retrieved = sorted(retrieved, key=lambda x: x["score"], reverse=True)
-    return retrieved[:k]
+    try:
+        D, I = INDEX.search(np.array([q_vec], dtype=np.float32), min(k, INDEX.ntotal))
+        print(f"DEBUG: Search results - Distances: {D}, Indices: {I}")
+        
+        retrieved = []
+        for score, idx in zip(D[0], I[0]):
+            if idx == -1 or idx >= len(DOC_STORE):
+                continue
+            ctx = DOC_STORE[int(idx)]
+            # Use a simpler scoring approach for now
+            retrieved.append({**ctx, "score": float(score)})
+        
+        retrieved = sorted(retrieved, key=lambda x: x["score"], reverse=True)
+        print(f"DEBUG: Retrieved {len(retrieved)} chunks")
+        return retrieved[:k]
+        
+    except Exception as e:
+        print(f"DEBUG: FAISS search failed: {e}")
+        return []
 
 
 def _chat_databricks(messages: t.List[dict], max_tokens: int) -> str:
@@ -705,7 +1016,7 @@ def agentic_chat(question: str, history: t.List[dict], k: int = 5, max_tokens: i
 def chat_with_rag(
     question: str,
     history: t.Optional[t.List[dict]] = None,
-    k: int = 5,
+    k: int = 8,
     max_tokens: int = 512
 ):
     """
@@ -717,6 +1028,12 @@ def chat_with_rag(
     # Retrieve context
     ctx_list = retrieve(question, k=k)
 
+
+    # DEBUG: Show what was retrieved
+    print(f"Retrieved {len(ctx_list)} chunks for question: '{question}'")
+    for i, ctx in enumerate(ctx_list):
+        print(f"Chunk {i+1}: {ctx['content'][:200]}...")
+
     # Build strict system prompt
     if ctx_list:
         context_text = "\n\n".join(
@@ -724,17 +1041,15 @@ def chat_with_rag(
             for c in ctx_list
         )
         system_prompt = (
-            "You are a strict document analysis assistant.\n"
-            "You MUST answer ONLY using the retrieved context provided below.\n"
-            "If the context does not contain the answer, reply exactly with: \"I don't know\".\n"
-            "Do not make up, infer, or guess information.\n\n"
+            "You are a helpful document analysis assistant.\n"
+            "Use the retrieved context below to answer the user's question accurately.\n"
+            "If the context contains the information needed to answer, provide a clear answer.\n"
+            "If the context is insufficient, you may say you don't know, but first try to infer from available information.\n\n"
             f"Retrieved context:\n{context_text}"
         )
     else:
         system_prompt = (
-            "You are a strict document analysis assistant.\n"
-            "No relevant context was found.\n"
-            "You MUST reply exactly with: \"I don't know\"."
+            "You are a helpful assistant. No relevant context was found for this question."
         )
 
     # Build message history
@@ -883,7 +1198,7 @@ if q:
     st.session_state.history.append({"role": "user", "content": q})
     with st.chat_message("assistant"):
         with st.spinner("🤖 Thinking (Agentic)" if AGENTIC_MODE else "🤔 Thinking…"):
-            ans, ctx = chat_with_rag(q, st.session_state.history[:-1])
+            ans, ctx = chat_with_rag(q, st.session_state.history[:-1], k=8)
         st.markdown(ans)
         if ctx:
             with st.expander("Sources"):
