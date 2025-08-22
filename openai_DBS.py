@@ -67,6 +67,8 @@ from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
 
+from databricks.sdk.core import Config
+
 import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
@@ -83,7 +85,22 @@ BACKEND_PROVIDER = os.getenv("BACKEND_PROVIDER", "DATABRICKS").strip().upper()
 # Databricks
 DB_HOST = os.getenv("DATABRICKS_HOST", "").replace("https://", "").strip()
 DB_HTTP_PATH = os.getenv("DATABRICKS_SQL_HTTP_PATH", "").strip()
-DB_TOKEN = os.getenv("DATABRICKS_TOKEN", "").strip()
+cfg = Config(
+    host=os.getenv("DATABRICKS_HOST"),
+    client_id=os.getenv("DATABRICKS_CLIENT_ID"),
+    client_secret=os.getenv("DATABRICKS_CLIENT_SECRET")
+)
+auth = cfg.authenticate()
+print("Auth result:", auth)
+
+if auth and "Authorization" in auth:
+    DATABRICKS_TOKEN = auth["Authorization"].replace("Bearer ", "")
+else:
+    raise RuntimeError("Failed to get OAuth token from Databricks")
+
+print("Token:", DATABRICKS_TOKEN[:10], "...")
+
+
 CHAT_ENDPOINT = os.getenv("CHAT_ENDPOINT", "").strip()
 EMBEDDING_ENDPOINT = os.getenv("EMBEDDING_ENDPOINT", "").strip()
 
@@ -204,9 +221,9 @@ def log_error(*args):
 # DB connection
 # --------------------
 def db_connect():
-    if not DB_HOST or not DB_HTTP_PATH or not DB_TOKEN:
+    if not DB_HOST or not DB_HTTP_PATH or not DATABRICKS_TOKEN:
         raise RuntimeError("Databricks SQL connection env vars are missing.")
-    return sql.connect(server_hostname=DB_HOST, http_path=DB_HTTP_PATH, access_token=DB_TOKEN)
+    return sql.connect(server_hostname=DB_HOST, http_path=DB_HTTP_PATH, access_token=DATABRICKS_TOKEN)
 
 # --------------------
 # Capability probing

@@ -2,23 +2,41 @@ import os
 from dotenv import load_dotenv
 from databricks.sdk import WorkspaceClient
 from mlflow.deployments import get_deploy_client
+from databricks.sdk.core import Config
+
 # Load environment variables from .env
 load_dotenv()
 
 # Read from env (remove spaces around '=' in .env)
-DBX_HOST = os.getenv("DATABRICKS_HOST")
-DBX_TOKEN = os.getenv("DATABRICKS_TOKEN")
+DATABRICKS_HOST = os.getenv("DATABRICKS_HOST")
 
 # Make sure MLflow also gets them
-os.environ["DATABRICKS_HOST"] = DBX_HOST
-os.environ["DATABRICKS_TOKEN"] = DBX_TOKEN
+os.environ["DATABRICKS_HOST"] = DATABRICKS_HOST
 
-w = WorkspaceClient(host=DBX_HOST, token=DBX_TOKEN)
+
+cfg = Config(
+    host=os.getenv("DATABRICKS_HOST"),
+    client_id=os.getenv("DATABRICKS_CLIENT_ID"),
+    client_secret=os.getenv("DATABRICKS_CLIENT_SECRET")
+)
+auth = cfg.authenticate()
+print("Auth result:", auth)
+
+if auth and "Authorization" in auth:
+    DATABRICKS_TOKEN = auth["Authorization"].replace("Bearer ", "")
+else:
+    raise RuntimeError("Failed to get OAuth token from Databricks")
+
+print("Token:", DATABRICKS_TOKEN[:10], "...")
+
+
+w = WorkspaceClient(config=cfg)
+print("W====",w.current_user.me()) 
 
 
 def _get_endpoint_task_type(endpoint_name: str) -> str:
     """Get the task type of a serving endpoint."""
-    w = WorkspaceClient(host=DBX_HOST, token=DBX_TOKEN)
+    w = WorkspaceClient(host=DATABRICKS_HOST, token=DATABRICKS_TOKEN)
     ep = w.serving_endpoints.get(endpoint_name)
     return ep.task
 

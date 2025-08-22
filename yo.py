@@ -61,7 +61,7 @@ CHAT_ENDPOINT = os.getenv("CHAT_ENDPOINT", "").strip()
 EMBEDDING_ENDPOINT = os.getenv("EMBEDDING_ENDPOINT", "").strip()
 DB_HOST = os.getenv("DATABRICKS_HOST", "").replace("https://", "").strip()
 DB_HTTP_PATH = os.getenv("DATABRICKS_SQL_HTTP_PATH", "").strip()
-DB_TOKEN = os.getenv("DATABRICKS_TOKEN", "").strip()
+DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN", "").strip()
 
 CATALOG = os.getenv("CATALOG", "main").strip()
 SCHEMA = os.getenv("SCHEMA", "default").strip()
@@ -121,9 +121,9 @@ def log_error(*args):
 # --------------------
 
 def db_connect():
-    if not DB_HOST or not DB_HTTP_PATH or not DB_TOKEN:
+    if not DB_HOST or not DB_HTTP_PATH or not DATABRICKS_TOKEN:
         raise RuntimeError("Databricks SQL connection env vars are missing.")
-    return sql.connect(server_hostname=DB_HOST, http_path=DB_HTTP_PATH, access_token=DB_TOKEN)
+    return sql.connect(server_hostname=DB_HOST, http_path=DB_HTTP_PATH, access_token=DATABRICKS_TOKEN)
 
 # --------------------
 # Capability probing

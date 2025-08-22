@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 load_dotenv()
 DB_HOST = os.getenv("DATABRICKS_HOST", "").replace("https://", "")
 DB_HTTP_PATH = os.getenv("DATABRICKS_SQL_HTTP_PATH")
-DB_TOKEN = os.getenv("DATABRICKS_TOKEN")
+DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN")
 DELTA_TABLE = os.getenv("DELTA_TABLE")
 
 # def main():
@@ -18,7 +18,7 @@ DELTA_TABLE = os.getenv("DELTA_TABLE")
 #     conn = sql.connect(
 #         server_hostname=DB_HOST,
 #         http_path=DB_HTTP_PATH,
-#         access_token=DB_TOKEN
+#         access_token=DATABRICKS_TOKEN
 #     )
     
 #     with conn.cursor() as cursor:
@@ -62,7 +62,7 @@ DELTA_TABLE = os.getenv("DELTA_TABLE")
 conn = sql.connect(
     server_hostname=DB_HOST,
     http_path=DB_HTTP_PATH,
-    access_token=DB_TOKEN
+    access_token=DATABRICKS_TOKEN
 )
 
 try:

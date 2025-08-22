@@ -20,7 +20,7 @@ AGENTIC_MODE = os.getenv("AGENTIC_MODE","False").lower() == "true"
 
 DB_HOST = os.getenv("DATABRICKS_HOST","").replace("https://","")
 DB_HTTP_PATH = os.getenv("DATABRICKS_SQL_HTTP_PATH")
-DB_TOKEN = os.getenv("DATABRICKS_TOKEN")
+DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN")
 
 client = get_deploy_client("databricks")
 vsc = VectorSearchClient()
@@ -35,7 +35,7 @@ def ensure_table_and_index(dim: int = 1024):
     conn = sql.connect(
         server_hostname=DB_HOST,
         http_path=DB_HTTP_PATH,
-        access_token=DB_TOKEN
+        access_token=DATABRICKS_TOKEN
     )
     with conn.cursor() as c:
         c.execute(f"""
@@ -192,7 +192,7 @@ def ingest_pdf(file_bytes, pdf_name):
 
 def write_rows(rows):
     """Write chunked PDF + embeddings to Delta table safely."""
-    conn = sql.connect(server_hostname=DB_HOST, http_path=DB_HTTP_PATH, access_token=DB_TOKEN)
+    conn = sql.connect(server_hostname=DB_HOST, http_path=DB_HTTP_PATH, access_token=DATABRICKS_TOKEN)
     with conn.cursor() as c:
         for r in rows:
             # r[5] is embedding: should be list[float] or empty list
@@ -214,7 +214,7 @@ def verify_embeddings(pdf_name=None, limit=5):
     Checks for empty arrays or NULL embeddings.
     Prints top rows and summary of missing embeddings.
     """
-    conn = sql.connect(server_hostname=DB_HOST, http_path=DB_HTTP_PATH, access_token=DB_TOKEN)
+    conn = sql.connect(server_hostname=DB_HOST, http_path=DB_HTTP_PATH, access_token=DATABRICKS_TOKEN)
     with conn.cursor() as c:
         query = f"SELECT pdf_name, page, chunk_id, embedding, content FROM {DELTA_TABLE}"
         if pdf_name:
